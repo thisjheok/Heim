@@ -1,0 +1,51 @@
+# Dependencies and build outputs
+node_modules/
+dist/
+dist-ssr/
+build/
+target/
+/app/src-tauri/gen/schemas/
+
+# Tool caches and test results
+.cache/
+.vite/
+.turbo/
+.parcel-cache/
+.next/
+.nuxt/
+.svelte-kit/
+.npm/
+.pnpm-store/
+.pytest_cache/
+__pycache__/
+.mypy_cache/
+.ruff_cache/
+coverage/
+playwright-report/
+test-results/
+.eslintcache
+*.tsbuildinfo
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+
+# Heim / GJC local runtime data
+.gjc/_session-*/
+.gjc/state/sdk/*.json
+
+# Local secrets and environment settings
+.env
+.env.*
+!.env.example
+
+# OS metadata and logs
+.DS_Store
+Thumbs.db
+desktop.ini
+logs/
+*.log

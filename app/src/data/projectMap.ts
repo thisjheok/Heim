@@ -19,6 +19,8 @@ export type ComponentData = {
   icon: ComponentIcon
   responsibilities: string[]
   files: string[]
+  questions?: string[]
+  answers?: Record<string, string>
 }
 
 export type LayerData = {

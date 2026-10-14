@@ -126,6 +126,18 @@ fn digest(text: &str) -> String {
         .collect()
 }
 
+fn matches_excerpt(source: &str, evidence: &str) -> bool {
+    if source.contains(evidence) {
+        return true;
+    }
+    let source_words: Vec<&str> = source.split_whitespace().collect();
+    let evidence_words: Vec<&str> = evidence.split_whitespace().collect();
+    !evidence_words.is_empty()
+        && source_words
+            .windows(evidence_words.len())
+            .any(|window| window == evidence_words)
+}
+
 fn verify_changes(
     map: &ProjectMap,
     changes: &MapChanges,
@@ -240,7 +252,7 @@ fn verify_changes(
                 && !files.iter().any(|file| {
                     contents
                         .get(file)
-                        .is_some_and(|text| text.contains(evidence.as_str()))
+                        .is_some_and(|text| matches_excerpt(text, evidence.as_str()))
                 }))
         {
             return Err("Proposal lacks a matching source excerpt".into());
@@ -384,7 +396,7 @@ pub async fn propose_map_update(
     std::fs::write(directory.join("map-proposal-schema.json"), OUTPUT_SCHEMA)
         .map_err(|error| error.to_string())?;
     let prompt = format!(
-        "Do not call tools. Heim has already read the changed source below. Maintain the project map so it reflects implemented source, not just the prior plan. If source exports a new function or implements a feature absent from the map, you MUST return a new component in additions (a generic goal node is not a match). Update an existing matching component by nodeId instead. For each source-backed addition/update copy a short EXACT excerpt into evidence and link its changed file. On deletion, remove a node only if its sole linked file was deleted: use removals with nodeId, deletedFile and reason. For a node with other linked files, use updates with removeFiles containing the deleted path, files empty when no other changed sources are relevant, and evidence exactly DELETED:<path>. Never propose an inability-to-inspect placeholder. Return empty arrays only if no behavior or relevant node changed. Do not modify files.\nChanged source: {}\nDeleted paths: {}\nCurrent map nodes: {}",
+        "Do not call tools. Heim has already read the changed source below. Maintain the project map so it reflects implemented source, not just the prior plan. If the changed files contain no map-relevant implementation change, return empty updates, additions, and removals. If source exports a new function or implements a feature absent from the map, return a new component in additions (a generic goal node is not a match). Update an existing matching component by nodeId instead. For each source-backed addition/update copy a short contiguous excerpt from the supplied file into evidence, preserving the source words exactly except for whitespace. Do not use ellipses, summaries, markdown fences, or invented text in evidence, and link its changed file. On deletion, remove a node only if its sole linked file was deleted: use removals with nodeId, deletedFile and reason. For a node with other linked files, use updates with removeFiles containing the deleted path, files empty when no other changed sources are relevant, and evidence exactly DELETED:<path>. Never propose an inability-to-inspect placeholder. Do not modify files.\nChanged source: {}\nDeleted paths: {}\nCurrent map nodes: {}",
         json!(contents),
         json!(deleted),
         json!(map.nodes)

@@ -224,6 +224,72 @@ fn item_id(params: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn command_is_safe(command: &str) -> bool {
+    let command = command.to_ascii_lowercase();
+    let risky = [
+        "rm ",
+        "rm -",
+        "del ",
+        "erase ",
+        "rmdir ",
+        "format ",
+        "git reset",
+        "git clean",
+        "git push",
+        "git commit",
+        "curl ",
+        "wget ",
+        "invoke-webrequest",
+        "powershell",
+        "cmd /c",
+        "ssh ",
+        "sudo ",
+        "chmod ",
+        "--force",
+        ".env",
+        "credential",
+    ];
+    if risky.iter().any(|token| command.contains(token)) {
+        return false;
+    }
+    [
+        "npm test",
+        "npm run build",
+        "npm run lint",
+        "node --test",
+        "cargo test",
+        "cargo check",
+        "cargo fmt",
+        "git status",
+        "git diff",
+        "git log",
+        "dir",
+        "ls",
+        "type ",
+        "cat ",
+    ]
+    .iter()
+    .any(|token| command.starts_with(token))
+}
+
+fn file_change_is_safe(params: &Value, root: &Path) -> bool {
+    let Some(changes) = params.get("changes").and_then(Value::as_array) else {
+        return false;
+    };
+    !changes.is_empty()
+        && changes.iter().all(|change| {
+            let Some(path) = change.get("path").and_then(Value::as_str) else {
+                return false;
+            };
+            let candidate = root.join(path);
+            let normalized = path.to_ascii_lowercase();
+            !Path::new(path).is_absolute()
+                && !normalized.contains(".env")
+                && !normalized.contains("credential")
+                && candidate.starts_with(root)
+        })
+}
+
 async fn read_events(
     app: AppHandle,
     project_id: i64,
@@ -262,13 +328,32 @@ async fn read_events(
                 method,
                 "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
             ) {
-                approvals.lock().await.insert(id);
                 let detail = params
                     .get("command")
                     .and_then(Value::as_str)
                     .or_else(|| params.get("reason").and_then(Value::as_str))
                     .or_else(|| params.get("grantRoot").and_then(Value::as_str))
                     .unwrap_or(method);
+                let auto_approve = match method {
+                    "item/commandExecution/requestApproval" => command_is_safe(detail),
+                    "item/fileChange/requestApproval" => file_change_is_safe(params, &root),
+                    _ => false,
+                };
+                if auto_approve {
+                    let _ =
+                        write_message(&writer, &json!({"id":id,"result":{"decision":"accept"}}))
+                            .await;
+                    emit(
+                        &app,
+                        project_id,
+                        "status",
+                        format!("Auto-approved safe agent request: {detail}"),
+                        item_id(params),
+                        None,
+                    );
+                    continue;
+                }
+                approvals.lock().await.insert(id);
                 emit(
                     &app,
                     project_id,
@@ -634,29 +719,19 @@ pub async fn send_development_message(
         })
         .collect::<Vec<_>>();
     let prompt = format!(
-        "The user approved Heim map revision {revision} and explicitly requested development for exactly this selected unit. Implement only the selected component; do not implement other map nodes. Respect the existing Codex workspace-write sandbox and approval policy.\n\nSelected component:\n{}\n\nDirectly related context (context only, not scope expansion):\n{}\n\nUser development request:\n{text}",
+        "The user approved Heim map revision {revision} and explicitly requested development for exactly this selected unit. Implement the selected product capability itself, not merely tests, fixtures, documentation, or a test harness. Do not create a tests-only result. Tests are allowed only as supporting verification after the product behavior is implemented. Do not implement other map nodes. Respect the existing Codex workspace-write sandbox and approval policy.\n\nSelected component:\n{}\n\nDirectly related context (context only, not scope expansion):\n{}\n\nUser development request:\n{text}",
         serde_json::to_string_pretty(selected).map_err(|error| error.to_string())?,
         serde_json::to_string_pretty(&related).map_err(|error| error.to_string())?,
     );
     let mut guard = manager.session.lock().await;
-    if guard.as_ref().is_some_and(|session| {
-        session.project_id != project_id
-            || session.mode != AgentMode::Development
-            || !session.alive.load(Ordering::Acquire)
-    }) {
-        if guard
-            .as_ref()
-            .is_some_and(|session| session.busy.load(Ordering::Acquire))
-        {
-            return Err(
-                "Finish or cancel the current agent turn before starting development".into(),
-            );
-        }
-        *guard = None;
+    if guard
+        .as_ref()
+        .is_some_and(|session| session.busy.load(Ordering::Acquire))
+    {
+        return Err("Finish or cancel the current agent turn before starting development".into());
     }
-    if guard.is_none() {
-        *guard = Some(start_session(&app, project_id, &root, AgentMode::Development).await?);
-    }
+    *guard = None;
+    *guard = Some(start_session(&app, project_id, &root, AgentMode::Development).await?);
     let session = guard.as_ref().ok_or("Agent session unavailable")?;
     if session.busy.swap(true, Ordering::AcqRel) {
         return Err("Agent is already working".into());
@@ -706,10 +781,10 @@ pub(crate) async fn request_design_draft(
         .map_err(|error| error.to_string())?;
     let prompt = match latest_draft {
         Some(draft) => format!(
-            "Revise the latest saved design draft only. Do not implement or create/edit files. Treat the saved draft below as the current user-edited source of truth; preserve stable IDs for unchanged nodes and apply the user's requested changes. Return exactly one JSON object without markdown using this schema: {{\"goal\":string,\"nodes\":[{{\"id\":string,\"title\":string,\"summary\":string,\"type\":\"component\",\"status\":\"not_started\"}}],\"edges\":[{{\"id\":string,\"source\":string,\"target\":string,\"label\":string}}],\"questions\":[string],\"assumptions\":[string]}}. Use unique stable IDs, valid edge endpoints, and status not_started for every node.\n\nUser change request:\n{text}\n\nLatest saved user-edited design draft:\n{draft}"
+            "Revise the latest saved design draft only. Do not implement or create/edit files. Treat the saved draft below as the current user-edited source of truth; preserve stable IDs for unchanged nodes and apply the user's requested changes. Return exactly one JSON object without markdown using this schema: {{\"goal\":string,\"nodes\":[{{\"id\":string,\"title\":string,\"summary\":string,\"type\":\"component\",\"status\":\"not_started\",\"questions\":[string]}}],\"edges\":[{{\"id\":string,\"source\":string,\"target\":string,\"label\":string}}],\"questions\":[string],\"assumptions\":[string]}}. Put unresolved decisions next to the relevant node in its questions array; use the top-level questions array only for project-wide questions. Use unique stable IDs, valid edge endpoints, and status not_started for every node.\n\nUser change request:\n{text}\n\nLatest saved user-edited design draft:\n{draft}"
         ),
         None => format!(
-            "Design a project map only. Do not implement or create/edit files. Return exactly one JSON object without markdown using this schema: {{\"goal\":string,\"nodes\":[{{\"id\":string,\"title\":string,\"summary\":string,\"type\":\"component\",\"status\":\"not_started\"}}],\"edges\":[{{\"id\":string,\"source\":string,\"target\":string,\"label\":string}}],\"questions\":[string],\"assumptions\":[string]}}. Use unique stable IDs, valid edge endpoints, and status not_started for every node.\n\nProduct description:\n{text}"
+            "Design a project map only. Do not implement or create/edit files. Return exactly one JSON object without markdown using this schema: {{\"goal\":string,\"nodes\":[{{\"id\":string,\"title\":string,\"summary\":string,\"type\":\"component\",\"status\":\"not_started\",\"questions\":[string]}}],\"edges\":[{{\"id\":string,\"source\":string,\"target\":string,\"label\":string}}],\"questions\":[string],\"assumptions\":[string]}}. Put unresolved decisions next to the relevant node in its questions array; use the top-level questions array only for project-wide questions. Use unique stable IDs, valid edge endpoints, and status not_started for every node.\n\nProduct description:\n{text}"
         ),
     };
     let (busy, response) = {
@@ -772,6 +847,54 @@ pub(crate) async fn request_design_draft(
         )
         .map_err(|error| error.to_string())?;
     Ok(DesignResponse { text, revision })
+}
+
+#[tauri::command]
+pub async fn send_design_message(
+    app: AppHandle,
+    manager: State<'_, AgentManager>,
+    project_id: i64,
+    text: String,
+    map_context: String,
+) -> Result<(), String> {
+    let text = text.trim();
+    if text.is_empty() || text.len() > 20_000 || map_context.len() > 200_000 {
+        return Err("Invalid design message".into());
+    }
+    let conn = database(&app)?;
+    ensure_project(&conn, project_id)?;
+    let root: String = conn
+        .query_row(
+            "SELECT root FROM projects WHERE id = ?1",
+            [project_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let prompt = format!(
+        "Discuss project design only. Do not create, edit, or delete files and do not run development work. Treat the confirmed Heim map below as context. Explain design implications or propose map changes in conversation; the user must explicitly save or approve map changes in Heim.\n\nConfirmed map:\n{map_context}\n\nUser design request:\n{text}"
+    );
+    let mut guard = manager.session.lock().await;
+    if guard
+        .as_ref()
+        .is_some_and(|session| session.busy.load(Ordering::Acquire))
+    {
+        return Err(
+            "Finish or cancel the current agent turn before starting a design message".into(),
+        );
+    }
+    *guard = None;
+    *guard = Some(start_session(&app, project_id, &root, AgentMode::Design).await?);
+    let session = guard.as_ref().ok_or("Agent session unavailable")?;
+    if session.busy.swap(true, Ordering::AcqRel) {
+        return Err("Agent is already working".into());
+    }
+    session
+        .request(
+            "turn/start",
+            json!({"threadId":session.thread_id,"input":[{"type":"text","text":prompt}],"cwd":root}),
+        )
+        .await
+        .map(|_| ())
 }
 
 #[tauri::command]

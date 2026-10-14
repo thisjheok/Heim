@@ -19,20 +19,14 @@ import {
   type ReactFlowInstance,
 } from '@xyflow/react'
 import {
-  Activity,
+  AlertCircle,
   Bot,
-  Boxes,
   Check,
-  ChevronDown,
   ChevronRight,
-  CircleHelp,
   ClipboardList,
   Code2,
   Database,
   FileCode2,
-  FileText,
-  Folder,
-  FolderOpen,
   GitBranch,
   LayoutGrid,
   Link2,
@@ -41,11 +35,8 @@ import {
   MessageCircle,
   Monitor,
   MoreHorizontal,
-  PanelRightClose,
   Plus,
-  Search,
   Send,
-  Settings2,
   ShieldCheck,
   Sparkles,
   SquareTerminal,
@@ -66,7 +57,7 @@ import './App.css'
 
 type ComponentFlowNode = Node<ComponentData, 'component'>
 type LayerFlowNode = Node<LayerData, 'layer'>
-type WorkspaceTab = 'chat' | 'tasks' | 'context' | 'terminal'
+type WorkspaceTab = 'chat' | 'terminal'
 type DetailTab = 'overview' | 'files' | 'tasks' | 'relationships'
 type ChatMessage = { id: string; text: string; time: string; role: 'user' | 'agent' | 'status' }
 type AgentEvent = { projectId: number; kind: 'delta' | 'message' | 'status' | 'files' | 'changed' | 'done' | 'disconnected' | 'approval'; text: string; itemId?: string; requestId?: number }
@@ -89,6 +80,9 @@ const componentTitle = (nodes: HeimNode[], id: string) => {
   const node = nodes.find((item) => item.id === id)
   return node?.type === 'component' ? node.data.title : id
 }
+
+const unansweredQuestions = (data: ComponentData) =>
+  (data.questions ?? []).filter((question) => !(data.answers?.[question] ?? '').trim())
 
 const iconByName: Record<ComponentIcon, LucideIcon> = {
   desktop: Monitor,
@@ -115,6 +109,7 @@ function ComponentNodeView({ data, selected }: NodeProps<ComponentFlowNode>) {
         <span>{data.kind}</span>
         <small>{data.technology}</small>
       </div>
+      {unansweredQuestions(data).length > 0 && <span className="node-question-badge" title="Unresolved question"><AlertCircle size={13} /></span>}
       <span className={`node-status-dot ${data.status === 'In progress' ? 'is-active' : ''}`} />
       <Handle type="source" position={Position.Right} />
     </div>
@@ -134,18 +129,8 @@ const nodeTypes = {
   layer: LayerNodeView,
 }
 
-const navItems = [
-  { label: 'Overview', caption: 'Project overview', icon: Activity },
-  { label: 'Project Map', caption: 'Visualize architecture', icon: Workflow },
-  { label: 'Components', caption: 'Manage components', icon: Boxes },
-  { label: 'Docs', caption: 'Architecture & notes', icon: FileText },
-  { label: 'Agents', caption: 'AI collaborators', icon: Bot },
-]
-
 const workspaceTabs: { id: WorkspaceTab; label: string; icon: LucideIcon }[] = [
   { id: 'chat', label: 'Chat', icon: MessageCircle },
-  { id: 'tasks', label: 'Tasks', icon: ListChecks },
-  { id: 'context', label: 'Context', icon: FileCode2 },
   { id: 'terminal', label: 'Terminal', icon: SquareTerminal },
 ]
 
@@ -162,7 +147,6 @@ function App() {
   const [selectedNodeId, setSelectedNodeId] = useState('project-map')
   const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<WorkspaceTab>('chat')
   const [activeDetailTab, setActiveDetailTab] = useState<DetailTab>('overview')
-  const [searchText, setSearchText] = useState('')
   const [draft, setDraft] = useState('')
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [agentVersion, setAgentVersion] = useState('')
@@ -174,28 +158,25 @@ function App() {
   const [designDraft, setDesignDraft] = useState<DesignDraft | null>(null)
   const [draftEdit, setDraftEdit] = useState<DesignDraft['draft'] | null>(null)
   const [draftEditDirty, setDraftEditDirty] = useState(false)
+  const [draftSelectedNodeId, setDraftSelectedNodeId] = useState('')
   const [developmentReady, setDevelopmentReady] = useState(false)
-  const [draftEdgeSource, setDraftEdgeSource] = useState('')
-  const [draftEdgeTarget, setDraftEdgeTarget] = useState('')
   const [reviewFiles, setReviewFiles] = useState<string[]>([])
   const [reviewingMap, setReviewingMap] = useState(false)
   const [reviewError, setReviewError] = useState('')
   const [notice, setNotice] = useState('')
   const [backendStatus, setBackendStatus] = useState<BackendStatus>({ kind: 'checking' })
   const [project, setProject] = useState<Project | null>(null)
-  const [recentProjects, setRecentProjects] = useState<Project[]>([])
-  const [projectMenuOpen, setProjectMenuOpen] = useState(false)
   const [mapRevision, setMapRevision] = useState(0)
   const [mapDirty, setMapDirty] = useState(false)
   const [editingNodeId, setEditingNodeId] = useState<string | null>(null)
   const [nodeTitle, setNodeTitle] = useState('')
   const [nodeSummary, setNodeSummary] = useState('')
   const [projectBusy, setProjectBusy] = useState(false)
-  const [projectTreeOpen, setProjectTreeOpen] = useState(true)
-  const [appTreeOpen, setAppTreeOpen] = useState(true)
+  const [agentPanelHeight, setAgentPanelHeight] = useState(300)
+  const [resizingAgentPanel, setResizingAgentPanel] = useState(false)
+  const mainColumnRef = useRef<HTMLElement | null>(null)
   const [flow, setFlow] = useState<ReactFlowInstance<HeimNode, Edge> | null>(null)
   const noticeTimer = useRef<number | undefined>(undefined)
-  const searchInput = useRef<HTMLInputElement>(null)
   const composerInput = useRef<HTMLTextAreaElement>(null)
   const mapChangeCount = useRef(0)
   const mapDirtyRef = useRef(false)
@@ -221,13 +202,6 @@ function App() {
 
   useEffect(() => {
     if (backendStatus.kind !== 'ready') return
-    invoke<Project[]>('recent_projects')
-      .then(setRecentProjects)
-      .catch((error: unknown) => showNotice(`Could not load recent projects: ${String(error)}`))
-  }, [backendStatus.kind])
-
-  useEffect(() => {
-    if (backendStatus.kind !== 'ready') return
     invoke<string>('agent_status').then(setAgentVersion).catch((error: unknown) => setAgentError(String(error)))
   }, [backendStatus.kind])
 
@@ -250,6 +224,11 @@ function App() {
         const requestId = payload.requestId
         setApprovals((current) => [...current, { id: requestId, text: payload.text }])
         setActiveWorkspaceTab('chat')
+        showNotice(`Codex approval required: ${payload.text}`)
+        if ('Notification' in window) {
+          if (Notification.permission === 'granted') new Notification('Heim · Codex approval required', { body: payload.text })
+          else if (Notification.permission === 'default') void Notification.requestPermission()
+        }
       } else {
         if (payload.kind === 'changed') {
           let files: string[] = []
@@ -286,21 +265,27 @@ function App() {
   }, [projectId, backendStatus.kind])
 
   useEffect(() => {
-    const focusSearch = (event: globalThis.KeyboardEvent) => {
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
-        event.preventDefault()
-        searchInput.current?.focus()
-      }
+    if (!resizingAgentPanel) return
+    const move = (event: PointerEvent) => {
+      const bounds = mainColumnRef.current?.getBoundingClientRect()
+      if (!bounds) return
+      const nextHeight = bounds.bottom - event.clientY
+      setAgentPanelHeight(Math.min(520, Math.max(180, nextHeight)))
     }
-
-    window.addEventListener('keydown', focusSearch)
-    return () => window.removeEventListener('keydown', focusSearch)
-  }, [])
+    const stop = () => setResizingAgentPanel(false)
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', stop)
+    return () => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', stop)
+    }
+  }, [resizingAgentPanel])
 
   const selectedNode = nodes.find(
     (node): node is ComponentFlowNode =>
       node.id === selectedNodeId && node.type === 'component',
   )
+  const developmentNode = selectedNode ?? nodes.find((node): node is ComponentFlowNode => node.type === 'component')
 
   const relatedNodes = useMemo(() => {
     const relatedIds = new Set(
@@ -337,10 +322,9 @@ function App() {
     setProject(next)
     setDesignDraft(pendingDraft)
     setDraftEdit(pendingDraft?.draft ?? null)
+    setDraftSelectedNodeId(pendingDraft?.draft.nodes[0]?.id ?? '')
     setDraftEditDirty(false)
     setDevelopmentReady(canDevelop)
-    setDraftEdgeSource('')
-    setDraftEdgeTarget('')
     setMapRevision(map.revision)
     setMapDirty(false)
     mapDirtyRef.current = false
@@ -354,9 +338,8 @@ function App() {
     setMapProposals(await invoke<MapProposal[]>('pending_map_proposals', { projectId: next.id }))
     setEditingNodeId(null)
     setActiveDetailTab('overview')
-    setProjectMenuOpen(false)
+
     void flow?.fitView({ duration: 350 })
-    setRecentProjects(await invoke<Project[]>('recent_projects'))
   }
 
   const confirmSwitch = () => {
@@ -377,45 +360,12 @@ function App() {
     }
   }
 
-  const reopenProject = async (id: number) => {
-    if (!confirmSwitch()) return
-    setProjectBusy(true)
-    try {
-      const next = await invoke<Project>('reopen_project', { projectId: id })
-      await loadProject(next)
-    } catch (error) {
-      showNotice(`Could not reopen project: ${String(error)}`)
-    } finally {
-      setProjectBusy(false)
-    }
-  }
 
-  const closeProject = () => {
-    if (!confirmSwitch()) return
-    setProject(null)
-    setNodes(initialNodes)
-    setEdges(initialEdges)
-    setSelectedNodeId('project-map')
-    setMapDirty(false)
-    setDevelopmentReady(false)
-    mapDirtyRef.current = false
-    setMessages([])
-    setChangedFiles([])
-    setApprovals([])
-    setReviewFiles([])
-    setReviewError('')
-    setMapProposals([])
-    setDesignDraft(null)
-    setDraftEdit(null)
-    setDraftEditDirty(false)
-    setEditingNodeId(null)
-    setProjectMenuOpen(false)
-  }
-
-  const saveMap = async () => {
-    if (!project || !mapDirty) return
+  const saveMap = async (): Promise<boolean> => {
+    if (!project || !mapDirty) return true
     setProjectBusy(true)
     const currentChangeCount = mapChangeCount.current
+    const wasDevelopmentReady = developmentReady
     try {
       const revision = await invoke<number>('save_project_map', {
         projectId: project.id,
@@ -428,14 +378,23 @@ function App() {
         },
       })
       setMapRevision(revision)
-      setDevelopmentReady(false)
+      setDevelopmentReady(wasDevelopmentReady)
       if (mapChangeCount.current === currentChangeCount) { setMapDirty(false); mapDirtyRef.current = false }
       showNotice('Project map saved.')
+      return true
     } catch (error) {
       showNotice(`Could not save map: ${String(error)}`)
+      return false
     } finally {
       setProjectBusy(false)
     }
+  }
+
+  const updateNodeQuestionAnswer = (nodeId: string, question: string, answer: string) => {
+    setNodes((current) => current.map((node) => node.id === nodeId && node.type === 'component'
+      ? { ...node, data: { ...node.data, answers: { ...(node.data.answers ?? {}), [question]: answer } } }
+      : node))
+    markMapDirty()
   }
 
   const saveDraftEdits = async () => {
@@ -500,55 +459,9 @@ function App() {
     setDraftEditDirty(true)
   }
 
-  const addDraftNode = () => {
-    const id = crypto.randomUUID()
-    const node: HeimNode = {
-      id,
-      type: 'component',
-      position: { x: (draftEdit?.nodes.length ?? 0) % 4 * 260, y: Math.floor((draftEdit?.nodes.length ?? 0) / 4) * 180 },
-      data: { title: 'New component', summary: '', kind: 'Planned component', technology: 'To be decided', status: 'Not started', icon: 'map', responsibilities: [], files: [] },
-    }
-    setDraftEdit((current) => current ? { ...current, nodes: [...current.nodes, node] } : current)
-    setDraftEditDirty(true)
-  }
-
-  const removeDraftNode = (nodeId: string) => {
-    setDraftEdit((current) => current ? { ...current, nodes: current.nodes.filter((node) => node.id !== nodeId), edges: current.edges.filter((edge) => edge.source !== nodeId && edge.target !== nodeId) } : current)
-    setDraftEditDirty(true)
-  }
-
-  const addDraftEdge = (source: string, target: string) => {
-    if (!draftEdit || !source || !target || source === target) return
-    if (draftEdit.edges.some((edge) => edge.source === source && edge.target === target)) return
-    const edge: Edge = { id: crypto.randomUUID(), source, target, label: 'related', type: 'smoothstep' }
-    setDraftEdit({ ...draftEdit, edges: [...draftEdit.edges, edge] })
-    setDraftEditDirty(true)
-  }
-
-  const handleSearch = (event: KeyboardEvent<HTMLInputElement>) => {
-    if (event.key !== 'Enter' || !searchText.trim()) return
-
-    const query = searchText.trim().toLowerCase()
-    const match = nodes.find(
-      (node) =>
-        node.type === 'component' &&
-        [node.data.title, node.data.kind, node.data.summary, ...node.data.files]
-          .join(' ')
-          .toLowerCase()
-          .includes(query),
-    )
-
-    if (!match) {
-      showNotice('No matching component or file was found in this map.')
-      return
-    }
-
-    setSelectedNodeId(match.id)
-    flow?.fitView({ nodes: [{ id: match.id }], duration: 350, padding: 0.55 })
-  }
 
   const addNode = () => {
-    if (!project || developmentReady) return
+    if (!project) return
     const id = crypto.randomUUID()
     const addedNodeCount = nodes.filter((node) => node.type === 'component').length - 8
     const offset = Math.max(0, addedNodeCount)
@@ -575,7 +488,7 @@ function App() {
   }
 
   const editNode = () => {
-    if (!selectedNode || !project || developmentReady) return
+    if (!selectedNode || !project) return
     setEditingNodeId(selectedNode.id)
     setNodeTitle(selectedNode.data.title)
     setNodeSummary(selectedNode.data.summary)
@@ -584,7 +497,7 @@ function App() {
 
   const updateNode = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
-    if (!editingNodeId || !nodeTitle.trim() || !project || developmentReady) return
+    if (!editingNodeId || !nodeTitle.trim() || !project) return
     setNodes((current) => current.map((node) => node.id === editingNodeId && node.type === 'component'
       ? { ...node, data: { ...node.data, title: nodeTitle.trim(), summary: nodeSummary.trim() } }
       : node))
@@ -593,15 +506,28 @@ function App() {
   }
 
   const handleConnect = (connection: Connection) => {
-    if (!project || developmentReady || connection.source === connection.target) return
+    if (!project || connection.source === connection.target) return
     setEdges((current) => addEdge(connection, current))
     markMapDirty()
+  }
+
+  const startDevelopment = async () => {
+    if (!project || !agentVersion || agentRunning || draftReviewActive || mapDirty || !developmentReady || !developmentNode || unansweredQuestions(developmentNode.data).length > 0) return
+    setAgentRunning(true)
+    setMessages((current) => [...current, { id: crypto.randomUUID(), role: 'status', text: `Starting development for ${developmentNode.data.title} in a new Agent session.`, time: new Date().toLocaleTimeString() }])
+    try {
+      await invoke('send_development_message', { projectId: project.id, nodeId: developmentNode.id, text: 'Proceed with the next development unit for the selected component. Implement only this component using the confirmed map context.' })
+    } catch (error) {
+      setAgentRunning(false)
+      setMessages((current) => [...current, { id: crypto.randomUUID(), role: 'status', text: `Could not start development: ${String(error)}`, time: new Date().toLocaleTimeString() }])
+    }
   }
 
   const sendMessage = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const text = draft.trim()
-    if (!text || !project || !agentVersion || agentRunning || reviewingMap || mapDirty || draftEditDirty || mapProposals.length > 0 || reviewError || (nodes.length > 0 && (!selectedNode || !developmentReady))) return
+    if (!text || !project || !agentVersion || agentRunning || reviewingMap || draftEditDirty || mapProposals.length > 0 || reviewError || (nodes.length > 0 && (!selectedNode || !developmentReady))) return
+    if (mapDirty && !(await saveMap())) return
 
     const creatingDraft = nodes.length === 0 && !designDraft
     const id = crypto.randomUUID()
@@ -624,6 +550,7 @@ function App() {
         const savedDraft = await invoke<DesignDraft>('create_design_draft', { projectId: project.id, description: text })
         setDesignDraft(savedDraft)
         setDraftEdit(savedDraft.draft)
+        setDraftSelectedNodeId(savedDraft.draft.nodes[0]?.id ?? '')
         setDraftEditDirty(false)
         setMessages((current) => [...current, { id: crypto.randomUUID(), role: 'status', text: `Design draft v${savedDraft.version} saved for review. The confirmed map is unchanged.`, time: new Date().toLocaleTimeString() }])
       } else if (draftReviewActive && designDraft) {
@@ -635,11 +562,11 @@ function App() {
         })
         setDesignDraft(revisedDraft)
         setDraftEdit(revisedDraft.draft)
+        setDraftSelectedNodeId(revisedDraft.draft.nodes[0]?.id ?? '')
         setDraftEditDirty(false)
         setMessages((current) => [...current, { id: crypto.randomUUID(), role: 'status', text: `Agent revision saved as draft v${revisedDraft.version}. The confirmed map is unchanged.`, time: new Date().toLocaleTimeString() }])
       } else {
-        if (!selectedNode) throw new Error('Select a component from the approved map before requesting development.')
-        await invoke('send_development_message', { projectId: project.id, nodeId: selectedNode.id, text })
+        await invoke('send_design_message', { projectId: project.id, text, mapContext: JSON.stringify({ nodes, edges }) })
       }
     } catch (error) {
       setAgentRunning(false)
@@ -709,6 +636,7 @@ function App() {
   }
 
   const activeNodeData = selectedNode?.data
+  const draftSelectedNode = draftEdit?.nodes.find((node) => node.id === draftSelectedNodeId)
 
   return (
     <main className="app-shell">
@@ -718,120 +646,37 @@ function App() {
           <span className="brand-name">Heim</span>
         </div>
 
-        <div className="topbar-project">
-          <button className="project-switcher" type="button" aria-label="Current project" aria-expanded={projectMenuOpen} onClick={() => setProjectMenuOpen((open) => !open)}>
-            <span className="project-name">{project?.name ?? 'Open a project'}</span>
-            <ChevronDown size={15} />
-            <span className="project-stage">{project ? (mapDirty ? 'Unsaved map changes' : 'Project map') : 'Desktop workspace'}</span>
-          </button>
-          {projectMenuOpen && (
-            <div className="project-menu">
-              <button type="button" onClick={chooseProject} disabled={backendStatus.kind !== 'ready' || projectBusy}>Open folder…</button>
-              {project && <button type="button" onClick={closeProject} disabled={projectBusy}>Close project</button>}
-              {recentProjects.length > 0 && <span>RECENT PROJECTS</span>}
-              {recentProjects.map((item) => (
-                <button type="button" key={item.id} disabled={projectBusy} onClick={() => reopenProject(item.id)} title={item.root}>{item.name}</button>
-              ))}
-              {backendStatus.kind !== 'ready' && <span>Project folders require the desktop app.</span>}
-            </div>
-          )}
-        </div>
-
-        <label className="global-search">
-          <Search size={17} />
-          <input
-            ref={searchInput}
-            aria-label="Search project map"
-            placeholder="Search components, files, or ask anything..."
-            value={searchText}
-            onChange={(event) => setSearchText(event.target.value)}
-            onKeyDown={handleSearch}
-          />
-          <kbd>⌘ K</kbd>
-        </label>
-
         <div className="topbar-actions">
-          <button className="button button-subtle share-button" type="button" disabled title="Team sharing is not part of this prototype">
-            <Link2 size={15} /> Share
-          </button>
-          <button className="button button-primary deploy-button" type="button" disabled={!project || !agentVersion} onClick={() => { setActiveWorkspaceTab('chat'); requestAnimationFrame(() => composerInput.current?.focus()) }}>
-            <Sparkles size={15} /> Talk to Codex
-          </button>
+          {project && <button
+            className="button button-development"
+            type="button"
+            onClick={startDevelopment}
+            disabled={!project || !agentVersion || agentRunning || draftReviewActive || mapDirty || !developmentReady || !developmentNode || unansweredQuestions(developmentNode.data).length > 0}
+            title={!developmentReady ? 'Approve a map before development' : developmentNode && unansweredQuestions(developmentNode.data).length > 0 ? 'Answer all node questions before development' : 'Develop the selected node in a new Agent session'}
+          >
+            <Code2 size={15} /> Develop next unit
+          </button>}
           <button className="avatar-button" type="button" aria-label="User profile">J</button>
         </div>
       </header>
 
-      <div className="workspace">
-        <aside className="sidebar">
-          <nav className="primary-nav" aria-label="Main navigation">
-            {navItems.map(({ label, caption, icon: Icon }) => (
-              <button
-                className={`nav-item${label === 'Project Map' ? ' is-active' : ''}`}
-                type="button"
-                key={label}
-                disabled={label !== 'Project Map'}
-                title={label === 'Project Map' ? undefined : 'Available in a later development stage'}
-              >
-                <Icon size={18} strokeWidth={1.8} />
-                <span className="nav-copy">
-                  <strong>{label}</strong>
-                  <small>{caption}</small>
-                </span>
-              </button>
-            ))}
-          </nav>
-
-          <div className="project-tree">
-            <div className="tree-heading">
-              <span>PROJECT</span>
-              <ChevronDown size={14} />
-            </div>
-            <button className="tree-row tree-root" type="button" onClick={() => setProjectTreeOpen((open) => !open)} title={project?.root}>
-              {projectTreeOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-              {projectTreeOpen ? <FolderOpen size={16} /> : <Folder size={16} />}
-              <span>{project?.name ?? 'Sample project'}</span>
-            </button>
-            {projectTreeOpen && !project && (
-              <div className="tree-children">
-                <button className="tree-row" type="button" onClick={() => setAppTreeOpen((open) => !open)}>
-                  {appTreeOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-                  {appTreeOpen ? <FolderOpen size={16} /> : <Folder size={16} />}
-                  <span>app</span>
-                </button>
-                {appTreeOpen && (
-                  <div className="tree-children tree-children-nested">
-                    <div className="tree-row tree-static"><ChevronRight size={13} /><Folder size={15} /><span>src</span></div>
-                    <div className="tree-row tree-static"><ChevronRight size={13} /><Folder size={15} /><span>src-tauri</span></div>
-                  </div>
-                )}
-                <div className="tree-row tree-static"><ChevronRight size={13} /><Folder size={16} /><span>docs</span></div>
-                <div className="tree-row tree-static"><ChevronRight size={13} /><Folder size={16} /><span>assets</span></div>
+      <div className={`workspace${project ? '' : ' startup-workspace'}`}>
+        {!project ? (
+          <section className="startup-screen" aria-label="Start Heim">
+            <div className="startup-card">
+              <div className="startup-icon"><Workflow size={30} /></div>
+              <h1>Start with a project</h1>
+              <p>Open an existing project folder or begin a new design from an empty folder.</p>
+              <div className="startup-actions">
+                <button className="button button-primary" type="button" onClick={chooseProject} disabled={backendStatus.kind !== 'ready' || projectBusy}>Open folder</button>
+                <button className="button button-outline" type="button" onClick={chooseProject} disabled={backendStatus.kind !== 'ready' || projectBusy}>Start new project</button>
               </div>
-            )}
-            {projectTreeOpen && project && <div className="tree-path" title={project.root}>{project.root}</div>}
-          </div>
-
-          <div className="sidebar-footer">
-            <div className="connection-indicator" role="status" title={backendStatus.kind === 'error' ? backendStatus.message : backendStatus.kind === 'ready' ? backendStatus.info.platform : undefined}>
-              <span className={backendStatus.kind === 'ready' ? 'is-ready' : ''} />
-              {backendStatus.kind === 'ready'
-                ? `Desktop connected · v${backendStatus.info.version} · ${agentRunning ? 'Agent working' : agentVersion ? 'Codex available' : 'Agent unavailable'}`
-                : backendStatus.kind === 'error'
-                  ? 'Desktop backend unavailable · Agent offline'
-                  : backendStatus.kind === 'browser'
-                    ? 'Browser preview · Agent offline'
-                    : 'Connecting to desktop backend…'}
+              <small>{backendStatus.kind === 'ready' ? 'Your project files stay on this computer.' : 'Desktop backend is connecting…'}</small>
             </div>
-            <button className="footer-action" type="button" disabled title="Settings are not available in this prototype">
-              <Settings2 size={16} /> Settings
-            </button>
-            <button className="footer-action" type="button" disabled title="Help is not available in this prototype">
-              <CircleHelp size={16} /> Help & feedback
-            </button>
-          </div>
-        </aside>
+          </section>
+        ) : <>
 
-        <section className="main-column" aria-label="Project map and agent workspace">
+        <section ref={mainColumnRef} className={`main-column${resizingAgentPanel ? ' is-resizing' : ''}`} style={{ gridTemplateRows: `72px minmax(250px, 1fr) ${agentPanelHeight}px` }} aria-label="Project map and agent workspace">
           <div className="map-toolbar">
             <div className="map-heading-icon"><Workflow size={21} /></div>
             <div className="map-heading-copy">
@@ -839,10 +684,11 @@ function App() {
               <p>Explore the shared plan and discuss each part with your agent.</p>
             </div>
             <div className="map-toolbar-actions">
-              <button className="button button-outline" type="button" onClick={addNode} disabled={!project || projectBusy || draftReviewActive || developmentReady}>
+              <button className="button button-outline" type="button" onClick={chooseProject} disabled={backendStatus.kind !== 'ready' || projectBusy}>Open folder</button>
+              {!draftReviewActive && <button className="button button-outline" type="button" onClick={addNode} disabled={!project || projectBusy}>
                 <Plus size={16} /> Add node
-              </button>
-              <button className="button button-primary" type="button" onClick={saveMap} disabled={!project || !mapDirty || projectBusy || draftReviewActive || developmentReady}>Save map</button>
+              </button>}
+              <button className="button button-primary" type="button" onClick={saveMap} disabled={!project || !mapDirty || projectBusy || draftReviewActive}>Save map</button>
               <button
                 className="button button-subtle fit-button"
                 type="button"
@@ -860,7 +706,7 @@ function App() {
           <div className="map-canvas">
             <ReactFlow<HeimNode, Edge>
               nodes={nodes}
-              edges={edges}
+              edges={edges.map((edge) => ({ ...edge, label: undefined }))}
               nodeTypes={nodeTypes}
               onNodesChange={(changes) => {
                 onNodesChange(changes)
@@ -883,8 +729,8 @@ function App() {
               minZoom={0.25}
               maxZoom={1.5}
               deleteKeyCode={null}
-              nodesConnectable={!!project && !projectBusy && !draftReviewActive && !developmentReady}
-              nodesDraggable={!!project && !projectBusy && !draftReviewActive && !developmentReady}
+              nodesConnectable={!!project && !projectBusy && !draftReviewActive}
+              nodesDraggable={!!project && !projectBusy && !draftReviewActive}
               elementsSelectable
               proOptions={{ hideAttribution: false }}
             >
@@ -897,42 +743,15 @@ function App() {
                 maskColor="rgba(248, 250, 253, 0.72)"
               />
             </ReactFlow>
-            {designDraft && draftEdit && nodes.length === 0 && <div className="draft-review-overlay" aria-label="Before and after design draft">
-              <section className="draft-before"><strong>Before · confirmed map</strong><span>Revision {designDraft.baseRevision}</span><p>No confirmed nodes. This draft has not changed the project map.</p></section>
-              <section className="draft-after">
-                <header><div><strong>After · draft v{designDraft.version}</strong><span>{draftEdit.nodes.length} nodes · {draftEdit.edges.length} relationships</span></div>
-                  <button className="button button-outline" type="button" onClick={addDraftNode} disabled={projectBusy || agentRunning}><Plus size={14} /> Add node</button>
-                  <button className="button button-primary" type="button" onClick={saveDraftEdits} disabled={!draftEditDirty || projectBusy || agentRunning}>Save edits</button>
-                </header>
-                <label className="draft-goal-field">Goal<input value={draftEdit.goal} maxLength={4000} disabled={agentRunning || projectBusy} onChange={(event) => { setDraftEdit({ ...draftEdit, goal: event.target.value }); setDraftEditDirty(true) }} /></label>
-                <div className="draft-editor-nodes">{draftEdit.nodes.map((node) => node.type === 'component' && <article className="draft-editor-node" key={node.id}>
-                  <div><input aria-label="Draft node title" value={node.data.title} maxLength={120} disabled={agentRunning || projectBusy} onChange={(event) => updateDraftNode(node.id, (current) => current.type === 'component' ? { ...current, data: { ...current.data, title: event.target.value } } : current)} />
-                    <button className="text-action" type="button" onClick={() => removeDraftNode(node.id)} disabled={agentRunning || projectBusy} aria-label={`Remove ${node.data.title}`}><X size={14} /></button></div>
-                  <textarea aria-label={`${node.data.title} summary`} value={node.data.summary} maxLength={4000} rows={2} disabled={agentRunning || projectBusy} onChange={(event) => updateDraftNode(node.id, (current) => current.type === 'component' ? { ...current, data: { ...current.data, summary: event.target.value } } : current)} />
-                  <small>Implementation: Not started</small>
-                </article>)}</div>
-                <div className="draft-editor-edges"><strong>Relationships</strong>
-                  {draftEdit.edges.map((edge) => <div className="draft-edge-row" key={edge.id}>
-                    <span>{componentTitle(draftEdit.nodes, edge.source)}</span><span>→</span><span>{componentTitle(draftEdit.nodes, edge.target)}</span>
-                    <input aria-label="Relationship label" value={typeof edge.label === 'string' ? edge.label : 'related'} disabled={agentRunning || projectBusy} onChange={(event) => { setDraftEdit({ ...draftEdit, edges: draftEdit.edges.map((item) => item.id === edge.id ? { ...item, label: event.target.value } : item) }); setDraftEditDirty(true) }} />
-                    <button className="text-action" type="button" onClick={() => { setDraftEdit({ ...draftEdit, edges: draftEdit.edges.filter((item) => item.id !== edge.id) }); setDraftEditDirty(true) }} disabled={agentRunning || projectBusy} aria-label="Remove relationship"><X size={14} /></button>
-                  </div>)}
-                  {draftEdit.nodes.length > 1 && <div className="draft-edge-add"><select aria-label="Relationship source" value={draftEdgeSource} disabled={agentRunning || projectBusy} onChange={(event) => setDraftEdgeSource(event.target.value)}><option value="">From node…</option>{draftEdit.nodes.map((node) => <option key={node.id} value={node.id}>{componentTitle(draftEdit.nodes, node.id)}</option>)}</select>
-                    <select aria-label="Relationship target" value={draftEdgeTarget} disabled={agentRunning || projectBusy} onChange={(event) => setDraftEdgeTarget(event.target.value)}><option value="">To node…</option>{draftEdit.nodes.map((node) => <option key={node.id} value={node.id}>{componentTitle(draftEdit.nodes, node.id)}</option>)}</select>
-                    <button className="button button-outline" type="button" onClick={() => { addDraftEdge(draftEdgeSource, draftEdgeTarget); setDraftEdgeSource(''); setDraftEdgeTarget('') }} disabled={agentRunning || projectBusy || !draftEdgeSource || !draftEdgeTarget || draftEdgeSource === draftEdgeTarget}>Add relationship</button></div>}
-                </div>
-                {(draftEdit.questions.length > 0 || draftEdit.assumptions.length > 0) && <div className="draft-open-items">{draftEdit.questions.map((item, index) => <p key={`q-${index}`}><strong>Question:</strong> {item}</p>)}{draftEdit.assumptions.map((item, index) => <p key={`a-${index}`}><strong>Assumption:</strong> {item}</p>)}</div>}
-                <footer className="draft-decision-actions">
-                  {draftEditDirty && <small>Save your edits before approving or rejecting this draft.</small>}
-                  <button className="button button-outline" type="button" onClick={() => resolveDesignDraft(false)} disabled={draftEditDirty || projectBusy || agentRunning}>Reject draft</button>
-                  <button className="button button-primary" type="button" onClick={() => resolveDesignDraft(true)} disabled={draftEditDirty || projectBusy || agentRunning}>Approve map</button>
-                </footer>
-              </section>
+            {designDraft && draftEdit && <div className={`draft-review-overlay${nodes.length === 0 ? ' is-initial' : ''}`} aria-label="Before and after design draft">
+              {nodes.length > 0 && <section className="draft-graph-pane"><header><strong>Before · confirmed map</strong><span>현재 확정된 지도</span></header><ReactFlow nodes={nodes} edges={edges.map((edge) => ({ ...edge, label: undefined }))} nodeTypes={nodeTypes} fitView fitViewOptions={{ padding: 0.18 }} nodesDraggable={false} nodesConnectable={false} elementsSelectable={false} zoomOnDoubleClick={false} panOnDrag><Background variant={BackgroundVariant.Dots} gap={18} size={1} color="#dce2ec" /></ReactFlow></section>}
+              <section className="draft-graph-pane draft-after-pane"><header><div><strong>After · draft v{designDraft.version}</strong><span>{draftEdit.nodes.length}개 노드 · {draftEdit.edges.length}개 관계 · 노드를 눌러 상세 확인</span></div><button className="button button-primary" type="button" onClick={() => resolveDesignDraft(true)} disabled={draftEditDirty || projectBusy || agentRunning}>Approve map</button></header><ReactFlow nodes={draftEdit.nodes} edges={draftEdit.edges.map((edge) => ({ ...edge, label: undefined }))} nodeTypes={nodeTypes} fitView fitViewOptions={{ padding: 0.18 }} nodesDraggable={false} nodesConnectable={false} onNodeClick={(_, node) => { if (node.type === 'component') setDraftSelectedNodeId(node.id) }}><Background variant={BackgroundVariant.Dots} gap={18} size={1} color="#dce2ec" /><Controls showInteractive={false} /></ReactFlow><div className="draft-graph-footer">{draftEditDirty ? 'Save edits in the node details panel before approving.' : 'Select a node to edit its name, description, or open questions.'}<button className="button button-outline" type="button" onClick={() => resolveDesignDraft(false)} disabled={draftEditDirty || projectBusy || agentRunning}>Reject draft</button><button className="button button-outline" type="button" onClick={saveDraftEdits} disabled={!draftEditDirty || projectBusy || agentRunning}>Save edits</button></div></section>
             </div>}
             <div className="preview-watermark">{project ? (mapDirty ? 'Unsaved project map' : project.name) : 'Sample project map'}</div>
           </div>
 
           <section className="agent-panel" aria-label="Agent workspace">
+            <button className="agent-panel-resizer" type="button" aria-label="Resize bottom workspace" onPointerDown={(event) => { event.preventDefault(); setResizingAgentPanel(true) }} title="Drag to resize" />
             <div className="agent-panel-header">
               <div className="workspace-tabs" role="tablist" aria-label="Workspace panels">
                 {workspaceTabs.map(({ id, label, icon: Icon }) => (
@@ -1038,36 +857,18 @@ function App() {
                     aria-label="Message the selected project component"
                     value={draft}
                     rows={1}
-                    placeholder={draftReviewActive ? 'Ask the Agent to revise the saved draft…' : nodes.length > 0 ? developmentReady ? `Request development for ${activeNodeData?.title ?? 'the selected node'}…` : 'Approve the map before requesting development…' : `Message ${activeNodeData?.title ?? 'the project'}... (⌘ ↵ to send)`}
-                    disabled={!project || !agentVersion || agentRunning || reviewingMap || mapDirty || draftEditDirty || mapProposals.length > 0 || !!reviewError || (nodes.length > 0 && (!developmentReady || !selectedNode))}
+                    placeholder={draftReviewActive ? 'Ask the Agent to revise the saved draft…' : nodes.length > 0 ? developmentReady ? unansweredQuestions(activeNodeData as ComponentData).length > 0 ? 'Answer the open question in Details to unlock development…' : `Request development for ${activeNodeData?.title ?? 'the selected node'}…` : 'Approve the map before requesting development…' : `Message ${activeNodeData?.title ?? 'the project'}... (⌘ ↵ to send)`}
+                    disabled={!project || !agentVersion || agentRunning || reviewingMap || draftEditDirty || mapProposals.length > 0 || !!reviewError || (nodes.length > 0 && (!developmentReady || !selectedNode))}
                     onChange={(event) => setDraft(event.target.value)}
                     onKeyDown={handleComposerKeyDown}
                   />
-                  <button className="send-button" type="submit" disabled={!draft.trim() || !project || !agentVersion || agentRunning || reviewingMap || mapDirty || draftEditDirty || mapProposals.length > 0 || !!reviewError || (nodes.length > 0 && (!developmentReady || !selectedNode))} aria-label={draftReviewActive ? 'Request design draft revision' : nodes.length > 0 ? 'Request development for selected map node' : 'Send message'}>
+                  <button className="send-button" type="submit" disabled={!draft.trim() || !project || !agentVersion || agentRunning || reviewingMap || draftEditDirty || mapProposals.length > 0 || !!reviewError || (nodes.length > 0 && (!developmentReady || !selectedNode))} aria-label={draftReviewActive ? 'Request design draft revision' : nodes.length > 0 ? 'Request development for selected map node' : 'Send message'}>
                     <Send size={17} />
                   </button>
                 </form>
               </div>
             )}
 
-            {activeWorkspaceTab === 'tasks' && (
-              <div className="workspace-content task-list">
-                <div className="workspace-content-heading"><ListChecks size={17} /><strong>Responsibilities for {activeNodeData?.title ?? 'this project'}</strong></div>
-                {(activeNodeData?.responsibilities ?? []).map((task) => (
-                  <div className="task-row" key={task}><span className="task-checkbox" /><span>{task}</span><small>Not started</small></div>
-                ))}
-                {!activeNodeData && <p className="muted-copy">Select a component to see its responsibilities.</p>}
-              </div>
-            )}
-
-            {activeWorkspaceTab === 'context' && (
-              <div className="workspace-content context-content">
-                <div className="workspace-content-heading"><FileCode2 size={17} /><strong>Context for this conversation</strong></div>
-                <div className="context-card"><span>SELECTED COMPONENT</span><strong>{activeNodeData?.title ?? 'No component selected'}</strong><p>{activeNodeData?.summary ?? 'Choose a node on the map to scope the conversation.'}</p></div>
-                <div className="context-card context-card-inline"><span>RELATED COMPONENTS</span><strong>{relatedNodes.length ? relatedNodes.map((node) => node.data.title).join(' · ') : 'None selected'}</strong></div>
-                <p className="context-footnote">The selected node and related titles are sent with each message to Codex.</p>
-              </div>
-            )}
 
             {activeWorkspaceTab === 'terminal' && (
               <div className="workspace-content terminal-content">
@@ -1079,17 +880,17 @@ function App() {
           </section>
         </section>
 
-        <aside className="details-panel" aria-label="Selected component details">
+        <aside className={`details-panel${draftReviewActive ? ' draft-details-panel' : ''}`} aria-label="Selected component details">
           <div className="details-summary">
-            <div className="details-icon">{activeNodeData ? (() => { const Icon = iconByName[activeNodeData.icon]; return <Icon size={23} /> })() : <Workflow size={23} />}</div>
+            <div className="details-icon">{draftSelectedNode?.type === 'component' ? <AlertCircle size={23} /> : activeNodeData ? (() => { const Icon = iconByName[activeNodeData.icon]; return <Icon size={23} /> })() : <Workflow size={23} />}</div>
             <div className="details-title-copy">
-              <h2>{activeNodeData?.title ?? 'Project Map'}</h2>
-              <span className="status-badge"><span />{activeNodeData?.status ?? 'No selection'}</span>
+              <h2>{draftSelectedNode?.type === 'component' ? draftSelectedNode.data.title : activeNodeData?.title ?? 'Project Map'}</h2>
+              <span className="status-badge"><span />{draftSelectedNode ? 'Design question' : activeNodeData?.status ?? 'No selection'}</span>
             </div>
-            <button className="button button-outline" type="button" onClick={editNode} disabled={!project || !activeNodeData || projectBusy || developmentReady}>Edit</button>
+            {!draftReviewActive && <button className="button button-outline" type="button" onClick={editNode} disabled={!project || !activeNodeData || projectBusy}>Edit</button>}
           </div>
 
-          <div className="detail-tabs" role="tablist" aria-label="Component details">
+          {!draftReviewActive && <div className="detail-tabs" role="tablist" aria-label="Component details">
             {detailTabs.map(({ id, label }) => (
               <button
                 className={`detail-tab${activeDetailTab === id ? ' is-active' : ''}`}
@@ -1102,10 +903,19 @@ function App() {
                 {label}
               </button>
             ))}
-          </div>
+          </div>}
 
           <div className="detail-scroll-area">
-            {activeDetailTab === 'overview' && activeNodeData && (
+            {draftReviewActive && draftSelectedNode?.type === 'component' && (
+              <div className="detail-section draft-node-detail">
+                <p className="detail-eyebrow">AFTER NODE</p>
+                <label>Node name<input value={draftSelectedNode.data.title} maxLength={120} disabled={projectBusy || agentRunning} onChange={(event) => updateDraftNode(draftSelectedNode.id, (node) => node.type === 'component' ? { ...node, data: { ...node.data, title: event.target.value } } : node)} /></label>
+                <label>Description<textarea value={draftSelectedNode.data.summary} rows={6} maxLength={4000} disabled={projectBusy || agentRunning} onChange={(event) => updateDraftNode(draftSelectedNode.id, (node) => node.type === 'component' ? { ...node, data: { ...node.data, summary: event.target.value } } : node)} /></label>
+                <div className="draft-question-panel"><h3><AlertCircle size={16} /> Open questions for this node</h3>{(draftSelectedNode.data.questions ?? []).length > 0 ? draftSelectedNode.data.questions?.map((question) => <p key={question}>{question}</p>) : <p className="muted-copy">No unresolved decisions for this node.</p>}</div>
+                <p className="draft-detail-hint">Edit the selected node here. The graph stays focused on structure; questions stay in the details panel.</p>
+              </div>
+            )}
+            {!draftReviewActive && activeDetailTab === 'overview' && activeNodeData && (
               <div className="detail-section">
                 {editingNodeId === selectedNodeId && (
                   <form className="node-editor" onSubmit={updateNode}>
@@ -1116,6 +926,7 @@ function App() {
                 )}
                 <h3>Summary</h3>
                 <p className="detail-summary-text">{activeNodeData.summary}</p>
+                {(activeNodeData.questions ?? []).length > 0 && <div className="draft-question-panel detail-question-panel"><h3><AlertCircle size={16} /> Open questions</h3>{activeNodeData.questions?.map((question) => <label className="question-answer" key={question}><span>{question}</span><textarea rows={3} placeholder="Answer this question to unlock development…" value={activeNodeData.answers?.[question] ?? ''} disabled={projectBusy} onChange={(event) => updateNodeQuestionAnswer(selectedNodeId, question, event.target.value)} /> </label>)}<small>{unansweredQuestions(activeNodeData).length > 0 ? 'Answer all questions, then save the map before development.' : 'All questions answered. Save the map to confirm these decisions.'}</small></div>}
                 <h3 className="section-heading-spaced">Key responsibilities</h3>
                 <ul className="responsibility-list">
                   {activeNodeData.responsibilities.map((item) => <li key={item}>{item}</li>)}
@@ -1132,7 +943,7 @@ function App() {
               </div>
             )}
 
-            {activeDetailTab === 'files' && (
+            {!draftReviewActive && activeDetailTab === 'files' && (
               <div className="detail-section">
                 <h3>Linked files</h3>
                 {activeNodeData?.files.length ? activeNodeData.files.map((file) => (
@@ -1141,7 +952,7 @@ function App() {
               </div>
             )}
 
-            {activeDetailTab === 'tasks' && (
+            {!draftReviewActive && activeDetailTab === 'tasks' && (
               <div className="detail-section">
                 <h3>Development tasks</h3>
                 {(activeNodeData?.responsibilities ?? []).map((task) => (
@@ -1151,7 +962,7 @@ function App() {
               </div>
             )}
 
-            {activeDetailTab === 'relationships' && (
+            {!draftReviewActive && activeDetailTab === 'relationships' && (
               <div className="detail-section">
                 <h3>Connected components</h3>
                 <RelationshipList relatedNodes={relatedNodes} onSelect={(id) => { setSelectedNodeId(id); setActiveDetailTab('overview') }} />
@@ -1160,8 +971,9 @@ function App() {
             )}
           </div>
 
-          <div className="details-footer"><PanelRightClose size={15} /><span>Details are scoped to the selected map node</span></div>
+
         </aside>
+        </>}
       </div>
 
       {notice && <div className="toast-notice" role="status"><Check size={16} />{notice}<button type="button" onClick={() => setNotice('')} aria-label="Dismiss notification"><X size={15} /></button></div>}

@@ -401,8 +401,19 @@ fn parse_design_response(response: &str) -> Result<DesignDraft, String> {
             .and_then(Value::as_str)
             .filter(|summary| summary.len() <= 4_000)
             .ok_or("Draft node summary is invalid")?;
+        let questions = raw
+            .get("questions")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let position = json!({"x": (index % 4) as i32 * 260, "y": (index / 4) as i32 * 180});
-        nodes.push(json!({"id":id,"type":"component","position":position,"data":{"title":title,"summary":summary,"kind":"Planned component","technology":"To be decided","status":"Not started","icon":"map","responsibilities":[],"files":[]}}));
+        nodes.push(json!({"id":id,"type":"component","position":position,"data":{"title":title,"summary":summary,"kind":"Planned component","technology":"To be decided","status":"Not started","icon":"map","responsibilities":[],"files":[],"questions":questions}}));
     }
     let edges = value
         .get("edges")
@@ -540,7 +551,7 @@ pub(crate) fn has_current_approved_map(conn: &Connection, project_id: i64) -> Re
         "SELECT EXISTS(
             SELECT 1 FROM project_maps m
             JOIN design_drafts d ON d.project_id = m.project_id
-            WHERE m.project_id = ?1 AND m.revision = d.base_revision + 1
+            WHERE m.project_id = ?1 AND m.revision >= d.base_revision + 1
               AND d.state = 'accepted' AND m.nodes != '[]'
         )",
         [project_id],
@@ -802,6 +813,7 @@ pub fn run() {
             revise_design_draft,
             agent::agent_status,
             agent::send_agent_message,
+            agent::send_design_message,
             agent::send_development_message,
             agent::cancel_agent_turn,
             agent::answer_agent_approval,
@@ -1034,7 +1046,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(!has_current_approved_map(&conn, 1).unwrap());
+        assert!(has_current_approved_map(&conn, 1).unwrap());
     }
 
     #[test]

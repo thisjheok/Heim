@@ -79,6 +79,7 @@ type MapProposal = { id: number; projectId: number; baseRevision: number; change
 type RuntimeInfo = { version: string; platform: string }
 type Project = { id: number; name: string; root: string }
 type StoredMap = { nodes: HeimNode[]; edges: Edge[]; revision: number }
+type DesignDraft = { id: number; projectId: number; baseRevision: number; version: number; draft: { goal: string; nodes: HeimNode[]; edges: Edge[]; questions: string[]; assumptions: string[] } }
 type BackendStatus =
   | { kind: 'checking' | 'browser' }
   | { kind: 'ready'; info: RuntimeInfo }
@@ -170,6 +171,12 @@ function App() {
   const [approvals, setApprovals] = useState<Approval[]>([])
   const [changedFiles, setChangedFiles] = useState<string[]>([])
   const [mapProposals, setMapProposals] = useState<MapProposal[]>([])
+  const [designDraft, setDesignDraft] = useState<DesignDraft | null>(null)
+  const [draftEdit, setDraftEdit] = useState<DesignDraft['draft'] | null>(null)
+  const [draftEditDirty, setDraftEditDirty] = useState(false)
+  const [developmentReady, setDevelopmentReady] = useState(false)
+  const [draftEdgeSource, setDraftEdgeSource] = useState('')
+  const [draftEdgeTarget, setDraftEdgeTarget] = useState('')
   const [reviewFiles, setReviewFiles] = useState<string[]>([])
   const [reviewingMap, setReviewingMap] = useState(false)
   const [reviewError, setReviewError] = useState('')
@@ -193,6 +200,7 @@ function App() {
   const mapChangeCount = useRef(0)
   const mapDirtyRef = useRef(false)
   const projectId = project?.id
+  const draftReviewActive = !!designDraft && nodes.length === 0
 
   useEffect(() => {
     if (!isTauri()) {
@@ -322,9 +330,17 @@ function App() {
 
   const loadProject = async (next: Project) => {
     const map = await invoke<StoredMap>('load_project_map', { projectId: next.id })
+    const pendingDraft = await invoke<DesignDraft | null>('pending_design_draft', { projectId: next.id })
+    const canDevelop = await invoke<boolean>('development_ready', { projectId: next.id })
     setNodes(map.nodes)
     setEdges(map.edges)
     setProject(next)
+    setDesignDraft(pendingDraft)
+    setDraftEdit(pendingDraft?.draft ?? null)
+    setDraftEditDirty(false)
+    setDevelopmentReady(canDevelop)
+    setDraftEdgeSource('')
+    setDraftEdgeTarget('')
     setMapRevision(map.revision)
     setMapDirty(false)
     mapDirtyRef.current = false
@@ -345,7 +361,7 @@ function App() {
 
   const confirmSwitch = () => {
     if (agentRunning) { showNotice('Cancel the running agent turn before switching projects.'); return false }
-    return !mapDirty || window.confirm('Unsaved map changes will be lost. Continue?')
+    return (!mapDirty && !draftEditDirty) || window.confirm('Unsaved map or design draft edits will be lost. Continue?')
   }
 
   const chooseProject = async () => {
@@ -381,6 +397,7 @@ function App() {
     setEdges(initialEdges)
     setSelectedNodeId('project-map')
     setMapDirty(false)
+    setDevelopmentReady(false)
     mapDirtyRef.current = false
     setMessages([])
     setChangedFiles([])
@@ -388,6 +405,9 @@ function App() {
     setReviewFiles([])
     setReviewError('')
     setMapProposals([])
+    setDesignDraft(null)
+    setDraftEdit(null)
+    setDraftEditDirty(false)
     setEditingNodeId(null)
     setProjectMenuOpen(false)
   }
@@ -408,6 +428,7 @@ function App() {
         },
       })
       setMapRevision(revision)
+      setDevelopmentReady(false)
       if (mapChangeCount.current === currentChangeCount) { setMapDirty(false); mapDirtyRef.current = false }
       showNotice('Project map saved.')
     } catch (error) {
@@ -415,6 +436,93 @@ function App() {
     } finally {
       setProjectBusy(false)
     }
+  }
+
+  const saveDraftEdits = async () => {
+    if (!project || !designDraft || !draftEdit || !draftEditDirty) return
+    setProjectBusy(true)
+    try {
+      const updated = await invoke<DesignDraft>('update_design_draft', {
+        projectId: project.id,
+        draftId: designDraft.id,
+        expectedVersion: designDraft.version,
+        draft: draftEdit,
+      })
+      setDesignDraft(updated)
+      setDraftEdit(updated.draft)
+      setDraftEditDirty(false)
+      showNotice('Design draft edits saved. Confirmed map is unchanged.')
+    } catch (error) {
+      showNotice(`Could not save draft edits: ${String(error)}`)
+    } finally {
+      setProjectBusy(false)
+    }
+  }
+
+  const resolveDesignDraft = async (accept: boolean) => {
+    if (!project || !designDraft || draftEditDirty || agentRunning) return
+    setProjectBusy(true)
+    try {
+      const map = await invoke<StoredMap | null>('resolve_design_draft', {
+        projectId: project.id,
+        draftId: designDraft.id,
+        expectedVersion: designDraft.version,
+        accept,
+      })
+      if (map) {
+        setNodes(map.nodes)
+        setEdges(map.edges)
+        setMapRevision(map.revision)
+        setSelectedNodeId(map.nodes.find((node) => node.type === 'component')?.id ?? '')
+        mapDirtyRef.current = false
+        setMapDirty(false)
+        setDevelopmentReady(true)
+      } else {
+        setDevelopmentReady(false)
+      }
+      setDesignDraft(null)
+      setDraftEdit(null)
+      setDraftEditDirty(false)
+      setMessages((current) => [...current, {
+        id: crypto.randomUUID(), role: 'status',
+        text: accept ? 'Design approved and saved as the confirmed map. Code changes require a separate development request.' : 'Design draft rejected. The confirmed map was not changed.',
+        time: new Date().toLocaleTimeString(),
+      }])
+    } catch (error) {
+      showNotice(`Could not ${accept ? 'approve' : 'reject'} design draft: ${String(error)}`)
+    } finally {
+      setProjectBusy(false)
+    }
+  }
+
+  const updateDraftNode = (nodeId: string, update: (node: HeimNode) => HeimNode) => {
+    setDraftEdit((current) => current ? { ...current, nodes: current.nodes.map((node) => node.id === nodeId ? update(node) : node) } : current)
+    setDraftEditDirty(true)
+  }
+
+  const addDraftNode = () => {
+    const id = crypto.randomUUID()
+    const node: HeimNode = {
+      id,
+      type: 'component',
+      position: { x: (draftEdit?.nodes.length ?? 0) % 4 * 260, y: Math.floor((draftEdit?.nodes.length ?? 0) / 4) * 180 },
+      data: { title: 'New component', summary: '', kind: 'Planned component', technology: 'To be decided', status: 'Not started', icon: 'map', responsibilities: [], files: [] },
+    }
+    setDraftEdit((current) => current ? { ...current, nodes: [...current.nodes, node] } : current)
+    setDraftEditDirty(true)
+  }
+
+  const removeDraftNode = (nodeId: string) => {
+    setDraftEdit((current) => current ? { ...current, nodes: current.nodes.filter((node) => node.id !== nodeId), edges: current.edges.filter((edge) => edge.source !== nodeId && edge.target !== nodeId) } : current)
+    setDraftEditDirty(true)
+  }
+
+  const addDraftEdge = (source: string, target: string) => {
+    if (!draftEdit || !source || !target || source === target) return
+    if (draftEdit.edges.some((edge) => edge.source === source && edge.target === target)) return
+    const edge: Edge = { id: crypto.randomUUID(), source, target, label: 'related', type: 'smoothstep' }
+    setDraftEdit({ ...draftEdit, edges: [...draftEdit.edges, edge] })
+    setDraftEditDirty(true)
   }
 
   const handleSearch = (event: KeyboardEvent<HTMLInputElement>) => {
@@ -440,7 +548,7 @@ function App() {
   }
 
   const addNode = () => {
-    if (!project) return
+    if (!project || developmentReady) return
     const id = crypto.randomUUID()
     const addedNodeCount = nodes.filter((node) => node.type === 'component').length - 8
     const offset = Math.max(0, addedNodeCount)
@@ -467,7 +575,7 @@ function App() {
   }
 
   const editNode = () => {
-    if (!selectedNode || !project) return
+    if (!selectedNode || !project || developmentReady) return
     setEditingNodeId(selectedNode.id)
     setNodeTitle(selectedNode.data.title)
     setNodeSummary(selectedNode.data.summary)
@@ -476,7 +584,7 @@ function App() {
 
   const updateNode = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
-    if (!editingNodeId || !nodeTitle.trim() || !project) return
+    if (!editingNodeId || !nodeTitle.trim() || !project || developmentReady) return
     setNodes((current) => current.map((node) => node.id === editingNodeId && node.type === 'component'
       ? { ...node, data: { ...node.data, title: nodeTitle.trim(), summary: nodeSummary.trim() } }
       : node))
@@ -485,7 +593,7 @@ function App() {
   }
 
   const handleConnect = (connection: Connection) => {
-    if (!project || connection.source === connection.target) return
+    if (!project || developmentReady || connection.source === connection.target) return
     setEdges((current) => addEdge(connection, current))
     markMapDirty()
   }
@@ -493,12 +601,9 @@ function App() {
   const sendMessage = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const text = draft.trim()
-    if (!text || !project || !agentVersion || agentRunning || reviewingMap || mapDirty || mapProposals.length > 0 || reviewError) return
+    if (!text || !project || !agentVersion || agentRunning || reviewingMap || mapDirty || draftEditDirty || mapProposals.length > 0 || reviewError || (nodes.length > 0 && (!selectedNode || !developmentReady))) return
 
-    const context = selectedNode ? JSON.stringify({ selectedNode: {
-      id: selectedNode.id, title: selectedNode.data.title, summary: selectedNode.data.summary,
-      responsibilities: selectedNode.data.responsibilities,
-    }, relatedNodes: relatedNodes.map((node) => ({ id: node.id, title: node.data.title })) }) : ''
+    const creatingDraft = nodes.length === 0 && !designDraft
     const id = crypto.randomUUID()
     setMessages((current) => [
       ...current,
@@ -515,7 +620,27 @@ function App() {
     setDraft('')
     setAgentRunning(true)
     try {
-      await invoke('send_agent_message', { projectId: project.id, text, context })
+      if (creatingDraft) {
+        const savedDraft = await invoke<DesignDraft>('create_design_draft', { projectId: project.id, description: text })
+        setDesignDraft(savedDraft)
+        setDraftEdit(savedDraft.draft)
+        setDraftEditDirty(false)
+        setMessages((current) => [...current, { id: crypto.randomUUID(), role: 'status', text: `Design draft v${savedDraft.version} saved for review. The confirmed map is unchanged.`, time: new Date().toLocaleTimeString() }])
+      } else if (draftReviewActive && designDraft) {
+        const revisedDraft = await invoke<DesignDraft>('revise_design_draft', {
+          projectId: project.id,
+          draftId: designDraft.id,
+          expectedVersion: designDraft.version,
+          request: text,
+        })
+        setDesignDraft(revisedDraft)
+        setDraftEdit(revisedDraft.draft)
+        setDraftEditDirty(false)
+        setMessages((current) => [...current, { id: crypto.randomUUID(), role: 'status', text: `Agent revision saved as draft v${revisedDraft.version}. The confirmed map is unchanged.`, time: new Date().toLocaleTimeString() }])
+      } else {
+        if (!selectedNode) throw new Error('Select a component from the approved map before requesting development.')
+        await invoke('send_development_message', { projectId: project.id, nodeId: selectedNode.id, text })
+      }
     } catch (error) {
       setAgentRunning(false)
       setMessages((current) => [...current, { id: crypto.randomUUID(), role: 'status', text: `Could not send message: ${String(error)}`, time: new Date().toLocaleTimeString() }])
@@ -559,6 +684,7 @@ function App() {
         setNodes(map.nodes)
         setEdges(map.edges)
         setMapRevision(map.revision)
+        setDevelopmentReady(false)
         setSelectedNodeId((current) => map.nodes.some((node) => node.id === current) ? current : map.nodes.find((node) => node.type === 'component')?.id ?? '')
       }
       setMapProposals((current) => current.filter((item) => item.id !== proposal.id))
@@ -713,10 +839,10 @@ function App() {
               <p>Explore the shared plan and discuss each part with your agent.</p>
             </div>
             <div className="map-toolbar-actions">
-              <button className="button button-outline" type="button" onClick={addNode} disabled={!project || projectBusy}>
+              <button className="button button-outline" type="button" onClick={addNode} disabled={!project || projectBusy || draftReviewActive || developmentReady}>
                 <Plus size={16} /> Add node
               </button>
-              <button className="button button-primary" type="button" onClick={saveMap} disabled={!project || !mapDirty || projectBusy}>Save map</button>
+              <button className="button button-primary" type="button" onClick={saveMap} disabled={!project || !mapDirty || projectBusy || draftReviewActive || developmentReady}>Save map</button>
               <button
                 className="button button-subtle fit-button"
                 type="button"
@@ -757,8 +883,8 @@ function App() {
               minZoom={0.25}
               maxZoom={1.5}
               deleteKeyCode={null}
-              nodesConnectable={!!project && !projectBusy}
-              nodesDraggable={!!project && !projectBusy}
+              nodesConnectable={!!project && !projectBusy && !draftReviewActive && !developmentReady}
+              nodesDraggable={!!project && !projectBusy && !draftReviewActive && !developmentReady}
               elementsSelectable
               proOptions={{ hideAttribution: false }}
             >
@@ -771,6 +897,38 @@ function App() {
                 maskColor="rgba(248, 250, 253, 0.72)"
               />
             </ReactFlow>
+            {designDraft && draftEdit && nodes.length === 0 && <div className="draft-review-overlay" aria-label="Before and after design draft">
+              <section className="draft-before"><strong>Before · confirmed map</strong><span>Revision {designDraft.baseRevision}</span><p>No confirmed nodes. This draft has not changed the project map.</p></section>
+              <section className="draft-after">
+                <header><div><strong>After · draft v{designDraft.version}</strong><span>{draftEdit.nodes.length} nodes · {draftEdit.edges.length} relationships</span></div>
+                  <button className="button button-outline" type="button" onClick={addDraftNode} disabled={projectBusy || agentRunning}><Plus size={14} /> Add node</button>
+                  <button className="button button-primary" type="button" onClick={saveDraftEdits} disabled={!draftEditDirty || projectBusy || agentRunning}>Save edits</button>
+                </header>
+                <label className="draft-goal-field">Goal<input value={draftEdit.goal} maxLength={4000} disabled={agentRunning || projectBusy} onChange={(event) => { setDraftEdit({ ...draftEdit, goal: event.target.value }); setDraftEditDirty(true) }} /></label>
+                <div className="draft-editor-nodes">{draftEdit.nodes.map((node) => node.type === 'component' && <article className="draft-editor-node" key={node.id}>
+                  <div><input aria-label="Draft node title" value={node.data.title} maxLength={120} disabled={agentRunning || projectBusy} onChange={(event) => updateDraftNode(node.id, (current) => current.type === 'component' ? { ...current, data: { ...current.data, title: event.target.value } } : current)} />
+                    <button className="text-action" type="button" onClick={() => removeDraftNode(node.id)} disabled={agentRunning || projectBusy} aria-label={`Remove ${node.data.title}`}><X size={14} /></button></div>
+                  <textarea aria-label={`${node.data.title} summary`} value={node.data.summary} maxLength={4000} rows={2} disabled={agentRunning || projectBusy} onChange={(event) => updateDraftNode(node.id, (current) => current.type === 'component' ? { ...current, data: { ...current.data, summary: event.target.value } } : current)} />
+                  <small>Implementation: Not started</small>
+                </article>)}</div>
+                <div className="draft-editor-edges"><strong>Relationships</strong>
+                  {draftEdit.edges.map((edge) => <div className="draft-edge-row" key={edge.id}>
+                    <span>{componentTitle(draftEdit.nodes, edge.source)}</span><span>→</span><span>{componentTitle(draftEdit.nodes, edge.target)}</span>
+                    <input aria-label="Relationship label" value={typeof edge.label === 'string' ? edge.label : 'related'} disabled={agentRunning || projectBusy} onChange={(event) => { setDraftEdit({ ...draftEdit, edges: draftEdit.edges.map((item) => item.id === edge.id ? { ...item, label: event.target.value } : item) }); setDraftEditDirty(true) }} />
+                    <button className="text-action" type="button" onClick={() => { setDraftEdit({ ...draftEdit, edges: draftEdit.edges.filter((item) => item.id !== edge.id) }); setDraftEditDirty(true) }} disabled={agentRunning || projectBusy} aria-label="Remove relationship"><X size={14} /></button>
+                  </div>)}
+                  {draftEdit.nodes.length > 1 && <div className="draft-edge-add"><select aria-label="Relationship source" value={draftEdgeSource} disabled={agentRunning || projectBusy} onChange={(event) => setDraftEdgeSource(event.target.value)}><option value="">From node…</option>{draftEdit.nodes.map((node) => <option key={node.id} value={node.id}>{componentTitle(draftEdit.nodes, node.id)}</option>)}</select>
+                    <select aria-label="Relationship target" value={draftEdgeTarget} disabled={agentRunning || projectBusy} onChange={(event) => setDraftEdgeTarget(event.target.value)}><option value="">To node…</option>{draftEdit.nodes.map((node) => <option key={node.id} value={node.id}>{componentTitle(draftEdit.nodes, node.id)}</option>)}</select>
+                    <button className="button button-outline" type="button" onClick={() => { addDraftEdge(draftEdgeSource, draftEdgeTarget); setDraftEdgeSource(''); setDraftEdgeTarget('') }} disabled={agentRunning || projectBusy || !draftEdgeSource || !draftEdgeTarget || draftEdgeSource === draftEdgeTarget}>Add relationship</button></div>}
+                </div>
+                {(draftEdit.questions.length > 0 || draftEdit.assumptions.length > 0) && <div className="draft-open-items">{draftEdit.questions.map((item, index) => <p key={`q-${index}`}><strong>Question:</strong> {item}</p>)}{draftEdit.assumptions.map((item, index) => <p key={`a-${index}`}><strong>Assumption:</strong> {item}</p>)}</div>}
+                <footer className="draft-decision-actions">
+                  {draftEditDirty && <small>Save your edits before approving or rejecting this draft.</small>}
+                  <button className="button button-outline" type="button" onClick={() => resolveDesignDraft(false)} disabled={draftEditDirty || projectBusy || agentRunning}>Reject draft</button>
+                  <button className="button button-primary" type="button" onClick={() => resolveDesignDraft(true)} disabled={draftEditDirty || projectBusy || agentRunning}>Approve map</button>
+                </footer>
+              </section>
+            </div>}
             <div className="preview-watermark">{project ? (mapDirty ? 'Unsaved project map' : project.name) : 'Sample project map'}</div>
           </div>
 
@@ -812,8 +970,8 @@ function App() {
                     <div className="chat-empty-state">
                       <div className="empty-state-icon"><Sparkles size={17} /></div>
                       <div>
-                        <strong>Discuss this part of your project</strong>
-                        <p>{project ? 'Select a map node for focused context, then message Codex.' : 'Open a project to chat with the agent.'}</p>
+                        <strong>{project && nodes.length === 0 ? 'Describe what you want to build' : 'Discuss this part of your project'}</strong>
+                        <p>{project ? nodes.length === 0 ? 'Your first message creates a read-only design draft. No project code is written.' : 'Select a map node for focused context, then message Codex.' : 'Open a project to chat with the agent.'}</p>
                       </div>
                       <span className="preview-note">{agentVersion || agentError || 'Desktop agent required'}</span>
                     </div>
@@ -832,6 +990,19 @@ function App() {
                   <button className="button button-outline" type="button" onClick={() => answerApproval('decline')}>Decline</button>
                   <button className="button button-primary" type="button" onClick={() => answerApproval('accept')}>Approve once</button>
                 </div>}
+                {designDraft && <div className="map-review" aria-label="Saved design draft">
+                  <strong>Unconfirmed design draft · v{designDraft.version}</strong>
+                  <p>{designDraft.draft.goal}</p>
+                  <span>{designDraft.draft.nodes.length} planned nodes · {designDraft.draft.edges.length} relationships · base map revision {designDraft.baseRevision}</span>
+                  {designDraft.draft.questions.map((question, index) => <small key={`q-${index}`}>Question: {question}</small>)}
+                  {designDraft.draft.assumptions.map((assumption, index) => <small key={`a-${index}`}>Assumption: {assumption}</small>)}
+                </div>}
+                {nodes.length > 0 && <div className="map-review" role="status">
+                  {developmentReady
+                    ? `Approved map revision ${mapRevision}. A development request will be limited to the selected component.`
+                    : 'Development is locked until this map revision has an approved design draft.'}
+                </div>}
+                {draftReviewActive && draftEditDirty && <div className="map-review" role="status">Save your direct After edits before asking the Agent to revise the draft.</div>}
                 {reviewingMap && <div className="map-review" role="status">Agent is comparing the changed code with the project map…</div>}
                 {mapProposals.length > 0 && <div className="map-review" aria-label="Map change proposal">
                   <strong>Agent map update · {mapProposals.length} pending</strong>
@@ -865,14 +1036,14 @@ function App() {
                   <textarea
                     ref={composerInput}
                     aria-label="Message the selected project component"
-                    placeholder={`Message ${activeNodeData?.title ?? 'the project'}... (⌘ ↵ to send)`}
                     value={draft}
                     rows={1}
-                    disabled={!project || !agentVersion || agentRunning || reviewingMap || mapDirty || mapProposals.length > 0 || !!reviewError}
+                    placeholder={draftReviewActive ? 'Ask the Agent to revise the saved draft…' : nodes.length > 0 ? developmentReady ? `Request development for ${activeNodeData?.title ?? 'the selected node'}…` : 'Approve the map before requesting development…' : `Message ${activeNodeData?.title ?? 'the project'}... (⌘ ↵ to send)`}
+                    disabled={!project || !agentVersion || agentRunning || reviewingMap || mapDirty || draftEditDirty || mapProposals.length > 0 || !!reviewError || (nodes.length > 0 && (!developmentReady || !selectedNode))}
                     onChange={(event) => setDraft(event.target.value)}
                     onKeyDown={handleComposerKeyDown}
                   />
-                  <button className="send-button" type="submit" disabled={!draft.trim() || !project || !agentVersion || agentRunning || reviewingMap || mapDirty || mapProposals.length > 0 || !!reviewError} aria-label="Send message">
+                  <button className="send-button" type="submit" disabled={!draft.trim() || !project || !agentVersion || agentRunning || reviewingMap || mapDirty || draftEditDirty || mapProposals.length > 0 || !!reviewError || (nodes.length > 0 && (!developmentReady || !selectedNode))} aria-label={draftReviewActive ? 'Request design draft revision' : nodes.length > 0 ? 'Request development for selected map node' : 'Send message'}>
                     <Send size={17} />
                   </button>
                 </form>
@@ -915,7 +1086,7 @@ function App() {
               <h2>{activeNodeData?.title ?? 'Project Map'}</h2>
               <span className="status-badge"><span />{activeNodeData?.status ?? 'No selection'}</span>
             </div>
-            <button className="button button-outline" type="button" onClick={editNode} disabled={!project || !activeNodeData || projectBusy}>Edit</button>
+            <button className="button button-outline" type="button" onClick={editNode} disabled={!project || !activeNodeData || projectBusy || developmentReady}>Edit</button>
           </div>
 
           <div className="detail-tabs" role="tablist" aria-label="Component details">

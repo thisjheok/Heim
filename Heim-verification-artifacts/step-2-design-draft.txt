@@ -1,0 +1,12 @@
+Heim 3.1 substep 2 verification
+Platform: Windows 11 x64
+Commands:
+  app/src-tauri: cargo fmt --check; cargo test --locked; cargo check --locked
+  app: npm run build; npm run lint
+Results:
+  Rust unit tests: 11 passed, 0 failed
+  Rust backend check: passed, no warnings
+  Frontend TypeScript/Vite production build: passed
+  ESLint: passed
+Coverage: draft schema validation; node status forced to Not started; invalid edge rejected; SQLite proposal persistence leaves confirmed map nodes/revision unchanged; frontend compiles/lints.
+Not performed: manual Tauri/Codex interaction, real AI response validation, nor file-system write-attempt scenario.

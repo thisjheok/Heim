@@ -19,15 +19,21 @@ use tokio::{
     time::{Duration, timeout},
 };
 
-use crate::{database, ensure_project};
+use crate::{database, ensure_project, has_current_approved_map};
 
 #[derive(Default)]
 pub struct AgentManager {
     session: Mutex<Option<Session>>,
 }
 
+pub(crate) struct DesignResponse {
+    pub text: String,
+    pub revision: i64,
+}
+
 struct Session {
     project_id: i64,
+    mode: AgentMode,
     thread_id: String,
     _child: Child,
     writer: Arc<Mutex<ChildStdin>>,
@@ -38,6 +44,28 @@ struct Session {
     alive: Arc<AtomicBool>,
     turn_id: Arc<Mutex<Option<String>>>,
     snapshot: Arc<Mutex<Option<FileSnapshot>>>,
+    response: Arc<Mutex<Option<String>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AgentMode {
+    Design,
+    Development,
+}
+
+impl AgentMode {
+    fn thread_policy(self) -> Value {
+        match self {
+            Self::Design => json!({"sandbox":"read-only", "approvalPolicy":"never"}),
+            Self::Development => {
+                json!({"sandbox":"workspace-write", "approvalPolicy":"on-request"})
+            }
+        }
+    }
+
+    fn permits_approval(self, decision: &str) -> bool {
+        self == Self::Development && matches!(decision, "accept" | "decline")
+    }
 }
 
 type FileSnapshot = HashMap<String, (u64, Option<SystemTime>)>;
@@ -207,6 +235,7 @@ async fn read_events(
     alive: Arc<AtomicBool>,
     turn_id: Arc<Mutex<Option<String>>>,
     snapshot: Arc<Mutex<Option<FileSnapshot>>>,
+    response: Arc<Mutex<Option<String>>>,
     root: PathBuf,
 ) {
     let mut lines = BufReader::new(stdout).lines();
@@ -324,6 +353,7 @@ async fn read_events(
                 match item.get("type").and_then(Value::as_str) {
                     Some("agentMessage") => {
                         if let Some(text) = item.get("text").and_then(Value::as_str) {
+                            *response.lock().await = Some(text.to_owned());
                             emit(&app, project_id, "message", text, item_id(params), None);
                         }
                     }
@@ -387,7 +417,12 @@ async fn read_events(
     );
 }
 
-async fn start_session(app: &AppHandle, project_id: i64, root: &str) -> Result<Session, String> {
+async fn start_session(
+    app: &AppHandle,
+    project_id: i64,
+    root: &str,
+    mode: AgentMode,
+) -> Result<Session, String> {
     let mut child = Command::new(codex_executable()?)
         .arg("app-server")
         .current_dir(root)
@@ -407,6 +442,7 @@ async fn start_session(app: &AppHandle, project_id: i64, root: &str) -> Result<S
     let alive = Arc::new(AtomicBool::new(true));
     let turn_id = Arc::new(Mutex::new(None));
     let snapshot = Arc::new(Mutex::new(None));
+    let response = Arc::new(Mutex::new(None));
     tokio::spawn(read_events(
         app.clone(),
         project_id,
@@ -418,10 +454,12 @@ async fn start_session(app: &AppHandle, project_id: i64, root: &str) -> Result<S
         alive.clone(),
         turn_id.clone(),
         snapshot.clone(),
+        response.clone(),
         PathBuf::from(root),
     ));
     let mut session = Session {
         project_id,
+        mode,
         thread_id: String::new(),
         _child: child,
         writer,
@@ -432,6 +470,7 @@ async fn start_session(app: &AppHandle, project_id: i64, root: &str) -> Result<S
         alive,
         turn_id,
         snapshot,
+        response,
     };
     session
         .request(
@@ -444,7 +483,9 @@ async fn start_session(app: &AppHandle, project_id: i64, root: &str) -> Result<S
         &json!({"method":"initialized","params":{}}),
     )
     .await?;
-    let thread = session.request("thread/start", json!({"cwd":root})).await?;
+    let mut thread_params = mode.thread_policy();
+    thread_params["cwd"] = json!(root);
+    let thread = session.request("thread/start", thread_params).await?;
     session.thread_id = thread
         .pointer("/thread/id")
         .and_then(Value::as_str)
@@ -500,9 +541,12 @@ pub async fn send_agent_message(
         *guard = None;
     }
     if guard.is_none() {
-        *guard = Some(start_session(&app, project_id, &root).await?);
+        *guard = Some(start_session(&app, project_id, &root, AgentMode::Design).await?);
     }
     let session = guard.as_ref().ok_or("Agent session unavailable")?;
+    if session.mode != AgentMode::Design {
+        return Err("Design requests require a read-only design session".into());
+    }
     if session.busy.swap(true, Ordering::AcqRel) {
         return Err("Agent is already working".into());
     }
@@ -531,6 +575,203 @@ pub async fn send_agent_message(
         session.busy.store(false, Ordering::Release);
     }
     result.map(|_| ())
+}
+
+#[tauri::command]
+pub async fn send_development_message(
+    app: AppHandle,
+    manager: State<'_, AgentManager>,
+    project_id: i64,
+    node_id: String,
+    text: String,
+) -> Result<(), String> {
+    let text = text.trim();
+    if text.is_empty() || text.len() > 20_000 || node_id.trim().is_empty() || node_id.len() > 128 {
+        return Err("Invalid development request".into());
+    }
+    let conn = database(&app)?;
+    ensure_project(&conn, project_id)?;
+    let (root, nodes_json, edges_json, revision): (String, String, String, i64) = conn
+        .query_row(
+            "SELECT p.root, m.nodes, m.edges, m.revision
+             FROM projects p JOIN project_maps m ON m.project_id = p.id WHERE p.id = ?1",
+            [project_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    if !has_current_approved_map(&conn, project_id)? {
+        return Err("Approve a design draft before starting development".into());
+    }
+    let nodes: Vec<Value> = serde_json::from_str(&nodes_json).map_err(|error| error.to_string())?;
+    let edges: Vec<Value> = serde_json::from_str(&edges_json).map_err(|error| error.to_string())?;
+    let selected = nodes
+        .iter()
+        .find(|node| {
+            node.get("id").and_then(Value::as_str) == Some(node_id.as_str())
+                && node.get("type").and_then(Value::as_str) == Some("component")
+        })
+        .ok_or("Select a component from the approved map")?;
+    let mut related_ids = HashSet::new();
+    for edge in &edges {
+        let source = edge.get("source").and_then(Value::as_str);
+        let target = edge.get("target").and_then(Value::as_str);
+        if source == Some(node_id.as_str()) {
+            if let Some(target) = target {
+                related_ids.insert(target.to_owned());
+            }
+        } else if target == Some(node_id.as_str()) {
+            if let Some(source) = source {
+                related_ids.insert(source.to_owned());
+            }
+        }
+    }
+    let related = nodes
+        .iter()
+        .filter(|node| {
+            node.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| related_ids.contains(id))
+        })
+        .collect::<Vec<_>>();
+    let prompt = format!(
+        "The user approved Heim map revision {revision} and explicitly requested development for exactly this selected unit. Implement only the selected component; do not implement other map nodes. Respect the existing Codex workspace-write sandbox and approval policy.\n\nSelected component:\n{}\n\nDirectly related context (context only, not scope expansion):\n{}\n\nUser development request:\n{text}",
+        serde_json::to_string_pretty(selected).map_err(|error| error.to_string())?,
+        serde_json::to_string_pretty(&related).map_err(|error| error.to_string())?,
+    );
+    let mut guard = manager.session.lock().await;
+    if guard.as_ref().is_some_and(|session| {
+        session.project_id != project_id
+            || session.mode != AgentMode::Development
+            || !session.alive.load(Ordering::Acquire)
+    }) {
+        if guard
+            .as_ref()
+            .is_some_and(|session| session.busy.load(Ordering::Acquire))
+        {
+            return Err(
+                "Finish or cancel the current agent turn before starting development".into(),
+            );
+        }
+        *guard = None;
+    }
+    if guard.is_none() {
+        *guard = Some(start_session(&app, project_id, &root, AgentMode::Development).await?);
+    }
+    let session = guard.as_ref().ok_or("Agent session unavailable")?;
+    if session.busy.swap(true, Ordering::AcqRel) {
+        return Err("Agent is already working".into());
+    }
+    let before = match tokio::task::spawn_blocking({
+        let root = PathBuf::from(&root);
+        move || file_snapshot(&root)
+    })
+    .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            session.busy.store(false, Ordering::Release);
+            return Err(error.to_string());
+        }
+    };
+    *session.snapshot.lock().await = Some(before);
+    let result = session.request(
+        "turn/start",
+        json!({"threadId":session.thread_id, "input":[{"type":"text", "text":prompt}], "cwd":root}),
+    ).await;
+    if result.is_err() {
+        session.busy.store(false, Ordering::Release);
+    }
+    result.map(|_| ())
+}
+
+pub(crate) async fn request_design_draft(
+    app: AppHandle,
+    manager: &AgentManager,
+    project_id: i64,
+    text: &str,
+    latest_draft: Option<&str>,
+) -> Result<DesignResponse, String> {
+    let text = text.trim();
+    if text.is_empty() || text.len() > 20_000 {
+        return Err("Invalid design request length".into());
+    }
+    let conn = database(&app)?;
+    ensure_project(&conn, project_id)?;
+    let root: String = conn
+        .query_row(
+            "SELECT root FROM projects WHERE id = ?1",
+            [project_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let prompt = match latest_draft {
+        Some(draft) => format!(
+            "Revise the latest saved design draft only. Do not implement or create/edit files. Treat the saved draft below as the current user-edited source of truth; preserve stable IDs for unchanged nodes and apply the user's requested changes. Return exactly one JSON object without markdown using this schema: {{\"goal\":string,\"nodes\":[{{\"id\":string,\"title\":string,\"summary\":string,\"type\":\"component\",\"status\":\"not_started\"}}],\"edges\":[{{\"id\":string,\"source\":string,\"target\":string,\"label\":string}}],\"questions\":[string],\"assumptions\":[string]}}. Use unique stable IDs, valid edge endpoints, and status not_started for every node.\n\nUser change request:\n{text}\n\nLatest saved user-edited design draft:\n{draft}"
+        ),
+        None => format!(
+            "Design a project map only. Do not implement or create/edit files. Return exactly one JSON object without markdown using this schema: {{\"goal\":string,\"nodes\":[{{\"id\":string,\"title\":string,\"summary\":string,\"type\":\"component\",\"status\":\"not_started\"}}],\"edges\":[{{\"id\":string,\"source\":string,\"target\":string,\"label\":string}}],\"questions\":[string],\"assumptions\":[string]}}. Use unique stable IDs, valid edge endpoints, and status not_started for every node.\n\nProduct description:\n{text}"
+        ),
+    };
+    let (busy, response) = {
+        let mut guard = manager.session.lock().await;
+        if guard.as_ref().is_some_and(|session| {
+            session.project_id != project_id
+                || session.mode != AgentMode::Design
+                || !session.alive.load(Ordering::Acquire)
+        }) {
+            if guard
+                .as_ref()
+                .is_some_and(|session| session.busy.load(Ordering::Acquire))
+            {
+                return Err(
+                    "Finish or cancel the current agent turn before changing projects".into(),
+                );
+            }
+            *guard = None;
+        }
+        if guard.is_none() {
+            *guard = Some(start_session(&app, project_id, &root, AgentMode::Design).await?);
+        }
+        let session = guard.as_ref().ok_or("Agent session unavailable")?;
+        if session.busy.swap(true, Ordering::AcqRel) {
+            return Err("Agent is already working".into());
+        }
+        *session.response.lock().await = None;
+        *session.snapshot.lock().await = None;
+        if let Err(error) = session
+            .request(
+                "turn/start",
+                json!({"threadId":session.thread_id, "input":[{"type":"text", "text":prompt}], "cwd":root}),
+            )
+            .await
+        {
+            session.busy.store(false, Ordering::Release);
+            return Err(error);
+        }
+        (session.busy.clone(), session.response.clone())
+    };
+    for _ in 0..300 {
+        if !busy.load(Ordering::Acquire) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if busy.load(Ordering::Acquire) {
+        return Err("Design response timed out; cancel the active turn before retrying".into());
+    }
+    let text = response
+        .lock()
+        .await
+        .clone()
+        .ok_or("Agent returned no design response")?;
+    let revision: i64 = conn
+        .query_row(
+            "SELECT revision FROM project_maps WHERE project_id = ?1",
+            [project_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(DesignResponse { text, revision })
 }
 
 #[tauri::command]
@@ -568,14 +809,14 @@ pub async fn answer_agent_approval(
     request_id: i64,
     decision: String,
 ) -> Result<(), String> {
-    if decision != "accept" && decision != "decline" {
-        return Err("Invalid approval decision".into());
-    }
     let guard = manager.session.lock().await;
     let session = guard
         .as_ref()
         .filter(|session| session.project_id == project_id)
         .ok_or("No agent session")?;
+    if !session.mode.permits_approval(&decision) {
+        return Err("Approvals are disabled in read-only design mode".into());
+    }
     if !session.approvals.lock().await.remove(&request_id) {
         return Err("Approval request is not pending".into());
     }
@@ -606,5 +847,29 @@ mod tests {
             changed_files(&before, &after),
             ["created.txt", "removed.txt", "updated.txt"]
         );
+    }
+
+    #[test]
+    fn design_policy_is_fixed_to_read_only_without_approval_escalation() {
+        let policy = AgentMode::Design.thread_policy();
+        assert_eq!(policy["sandbox"], "read-only");
+        assert_eq!(policy["approvalPolicy"], "never");
+        assert!(!AgentMode::Design.permits_approval("accept"));
+        assert!(!AgentMode::Design.permits_approval("decline"));
+    }
+
+    #[test]
+    fn development_policy_allows_only_explicit_approval_responses() {
+        assert_eq!(
+            AgentMode::Development.thread_policy()["sandbox"],
+            "workspace-write"
+        );
+        assert_eq!(
+            AgentMode::Development.thread_policy()["approvalPolicy"],
+            "on-request"
+        );
+        assert!(AgentMode::Development.permits_approval("accept"));
+        assert!(AgentMode::Development.permits_approval("decline"));
+        assert!(!AgentMode::Development.permits_approval("other"));
     }
 }

@@ -1,0 +1,12 @@
+Heim 3.1 substep 4 verification
+Platform: Windows 11 x64
+Commands:
+  app/src-tauri: cargo fmt --check; cargo test --locked; cargo check --locked
+  app: npm run build; npm run lint
+Results:
+  Rust unit tests: 12 passed, 0 failed
+  Rust backend check: passed
+  Frontend TypeScript/Vite production build: passed
+  ESLint: passed
+Coverage: revision request loads latest persisted draft from SQLite (not a frontend-supplied snapshot); prompt includes it as source of truth plus user's request; direct edits must be saved before chat request; generated proposal validates and updates only if draft version and base map revision still match; stale Agent response test confirms newer direct edit is preserved; Agent wait releases session lock so cancel remains available.
+Not performed: manual Tauri/Codex interaction or external real-Agent concurrency test.

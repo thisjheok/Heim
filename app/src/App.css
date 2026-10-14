@@ -185,6 +185,30 @@
 .map-canvas .react-flow__minimap { overflow: hidden; border: 1px solid #e1e6ee; border-radius: 7px; background: rgba(255,255,255,0.92); }
 .map-canvas .react-flow__attribution { right: 10px; bottom: 4px; padding: 1px 4px; border-radius: 3px; background: rgba(255,255,255,.74); font-size: 8px; }
 .preview-watermark { position: absolute; top: 12px; right: 13px; z-index: 1; padding: 4px 7px; border: 1px solid #e8ebf0; border-radius: 5px; color: #8b95a5; background: rgba(255,255,255,.8); font-size: 9px; pointer-events: none; }
+.draft-review-overlay { position: absolute; z-index: 2; inset: 0; display: grid; grid-template-columns: minmax(180px, .72fr) minmax(0, 1.5fr); gap: 10px; overflow: hidden; padding: 14px; background: rgba(248,250,253,.97); }
+.draft-before, .draft-after { display: flex; min-width: 0; flex-direction: column; gap: 9px; overflow: auto; padding: 12px; border: 1px solid #e1e6ee; border-radius: 9px; background: #fff; }
+.draft-before { align-self: start; max-height: 100%; }
+.draft-before strong, .draft-after header strong { color: #27344b; font-size: 12px; }
+.draft-before > span, .draft-after header span { color: #8791a2; font-size: 10px; }
+.draft-before p { color: #788397; font-size: 11px; line-height: 1.5; }
+.draft-after header { display: flex; align-items: center; gap: 7px; }
+.draft-after header > div { display: grid; flex: 1; gap: 3px; }
+.draft-after .button { min-height: 29px; padding: 0 8px; font-size: 10px; }
+.draft-goal-field { display: grid; gap: 4px; color: #66738a; font-size: 10px; }
+.draft-goal-field input, .draft-editor-node input, .draft-editor-node textarea, .draft-edge-row input, .draft-edge-add select { min-width: 0; padding: 6px 7px; border: 1px solid #e1e6ee; border-radius: 5px; color: #334158; background: #fff; font: inherit; }
+.draft-editor-nodes { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 7px; }
+.draft-editor-node { display: grid; gap: 5px; padding: 8px; border: 1px solid #e5eaf2; border-radius: 7px; background: #fbfcff; }
+.draft-editor-node > div { display: flex; gap: 5px; }
+.draft-editor-node > div input { flex: 1; font-weight: 650; }
+.draft-editor-node textarea { resize: vertical; }
+.draft-editor-node small { color: #8791a2; font-size: 9px; }
+.draft-editor-edges { display: grid; gap: 6px; padding-top: 7px; border-top: 1px solid #edf0f4; }
+.draft-editor-edges > strong { color: #536178; font-size: 10px; }
+.draft-edge-row, .draft-edge-add { display: flex; align-items: center; gap: 6px; min-width: 0; color: #6f7b90; font-size: 10px; }
+.draft-edge-row > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.draft-edge-row input, .draft-edge-add select { flex: 1; }
+.draft-open-items { display: grid; gap: 2px; padding: 7px; border-radius: 5px; background: #f7f9fc; }
+.draft-open-items p { margin: 0; color: #697891; font-size: 10px; line-height: 1.4; }
 
 .react-flow__node-component { width: 205px; border: 0; border-radius: 9px; background: transparent; box-shadow: none; }
 .react-flow__node-component.selected { border: 0; box-shadow: none; }

@@ -1,0 +1,12 @@
+Heim 3.1 substep 5 verification
+Platform: Windows 11 x64
+Commands:
+  app/src-tauri: cargo fmt --check; cargo test --locked; cargo check --locked
+  app: npm run build; npm run lint
+Results:
+  Rust unit tests: 14 passed, 0 failed
+  Rust backend check: passed
+  Frontend TypeScript/Vite production build: passed
+  ESLint: passed
+Coverage: accepting a pending draft atomically writes the confirmed map and marks the draft accepted; rejection leaves the confirmed map unchanged; duplicate/stale approval fails; development is locked before approval and after the approved map revision changes; the development Agent thread uses workspace-write plus on-request approval; the UI requires an approved map and one selected component before sending a separate development request; design-mode execution remains read-only.
+Not performed: manual Tauri app experience or a real Codex code-writing request, per user request.

@@ -22,11 +22,15 @@ import {
   AlertCircle,
   Bot,
   Check,
+  ChevronDown,
+  ChevronLeft,
   ChevronRight,
   ClipboardList,
   Code2,
   Database,
   FileCode2,
+  FolderOpen,
+  FolderPlus,
   GitBranch,
   LayoutGrid,
   Link2,
@@ -166,6 +170,10 @@ function App() {
   const [notice, setNotice] = useState('')
   const [backendStatus, setBackendStatus] = useState<BackendStatus>({ kind: 'checking' })
   const [project, setProject] = useState<Project | null>(null)
+  const [projectHasContent, setProjectHasContent] = useState(false)
+  const [recentProjects, setRecentProjects] = useState<Project[]>([])
+  const [projectMenuOpen, setProjectMenuOpen] = useState(false)
+  const [projectSidebarCollapsed, setProjectSidebarCollapsed] = useState(false)
   const [mapRevision, setMapRevision] = useState(0)
   const [mapDirty, setMapDirty] = useState(false)
   const [editingNodeId, setEditingNodeId] = useState<string | null>(null)
@@ -175,6 +183,7 @@ function App() {
   const [agentPanelHeight, setAgentPanelHeight] = useState(300)
   const [resizingAgentPanel, setResizingAgentPanel] = useState(false)
   const mainColumnRef = useRef<HTMLElement | null>(null)
+  const projectMenuRef = useRef<HTMLDivElement | null>(null)
   const [flow, setFlow] = useState<ReactFlowInstance<HeimNode, Edge> | null>(null)
   const noticeTimer = useRef<number | undefined>(undefined)
   const composerInput = useRef<HTMLTextAreaElement>(null)
@@ -182,6 +191,47 @@ function App() {
   const mapDirtyRef = useRef(false)
   const projectId = project?.id
   const draftReviewActive = !!designDraft && nodes.length === 0
+  const isChatStart = !!project && nodes.length === 0 && !designDraft && !projectHasContent
+  const showChatStarter = isChatStart && messages.length === 0
+
+  const projectMenuControl = (
+    <div className="project-menu-anchor" ref={projectMenuRef}>
+      <button
+        className="project-switcher"
+        type="button"
+        aria-haspopup="menu"
+        aria-expanded={projectMenuOpen}
+        onClick={() => setProjectMenuOpen((open) => !open)}
+      >
+        <span className="project-name">{project?.name}</span>
+        <ChevronDown size={16} />
+      </button>
+      {projectMenuOpen && <div className="project-menu" role="menu">
+        <button type="button" role="menuitem" onClick={() => { setProjectMenuOpen(false); void chooseProject() }} disabled={backendStatus.kind !== 'ready' || projectBusy}>
+          <FolderOpen size={15} /> Open another folder
+        </button>
+        <button type="button" role="menuitem" onClick={() => { setProjectMenuOpen(false); void chooseProject() }} disabled={backendStatus.kind !== 'ready' || projectBusy}>
+          <FolderPlus size={15} /> New project
+        </button>
+      </div>}
+    </div>
+  )
+
+  useEffect(() => {
+    if (!projectMenuOpen) return
+    const closeOnPointerDown = (event: PointerEvent) => {
+      if (!(event.target instanceof globalThis.Node) || !projectMenuRef.current?.contains(event.target)) setProjectMenuOpen(false)
+    }
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') setProjectMenuOpen(false)
+    }
+    document.addEventListener('pointerdown', closeOnPointerDown)
+    window.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.removeEventListener('pointerdown', closeOnPointerDown)
+      window.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [projectMenuOpen])
 
   useEffect(() => {
     if (!isTauri()) {
@@ -204,6 +254,15 @@ function App() {
     if (backendStatus.kind !== 'ready') return
     invoke<string>('agent_status').then(setAgentVersion).catch((error: unknown) => setAgentError(String(error)))
   }, [backendStatus.kind])
+
+  useEffect(() => {
+    if (backendStatus.kind !== 'ready') return
+    let active = true
+    invoke<Project[]>('recent_projects')
+      .then((projects) => { if (active) setRecentProjects(projects) })
+      .catch((error: unknown) => { if (active) setAgentError(String(error)) })
+    return () => { active = false }
+  }, [backendStatus.kind, projectId])
 
   useEffect(() => {
     if (projectId === undefined || backendStatus.kind !== 'ready') return
@@ -270,7 +329,8 @@ function App() {
       const bounds = mainColumnRef.current?.getBoundingClientRect()
       if (!bounds) return
       const nextHeight = bounds.bottom - event.clientY
-      setAgentPanelHeight(Math.min(520, Math.max(180, nextHeight)))
+      const maxHeight = Math.min(520, bounds.height - 72 - 180)
+      setAgentPanelHeight(Math.max(180, Math.min(maxHeight, nextHeight)))
     }
     const stop = () => setResizingAgentPanel(false)
     window.addEventListener('pointermove', move)
@@ -317,9 +377,11 @@ function App() {
     const map = await invoke<StoredMap>('load_project_map', { projectId: next.id })
     const pendingDraft = await invoke<DesignDraft | null>('pending_design_draft', { projectId: next.id })
     const canDevelop = await invoke<boolean>('development_ready', { projectId: next.id })
+    const hasContent = await invoke<boolean>('project_has_content', { projectId: next.id })
     setNodes(map.nodes)
     setEdges(map.edges)
     setProject(next)
+    setProjectHasContent(hasContent)
     setDesignDraft(pendingDraft)
     setDraftEdit(pendingDraft?.draft ?? null)
     setDraftSelectedNodeId(pendingDraft?.draft.nodes[0]?.id ?? '')
@@ -338,6 +400,7 @@ function App() {
     setMapProposals(await invoke<MapProposal[]>('pending_map_proposals', { projectId: next.id }))
     setEditingNodeId(null)
     setActiveDetailTab('overview')
+    setActiveWorkspaceTab('chat')
 
     void flow?.fitView({ duration: 350 })
   }
@@ -355,6 +418,19 @@ function App() {
       if (next) await loadProject(next)
     } catch (error) {
       showNotice(`Could not open project: ${String(error)}`)
+    } finally {
+      setProjectBusy(false)
+    }
+  }
+
+  const openRecentProject = async (projectId: number) => {
+    if (!confirmSwitch()) return
+    setProjectBusy(true)
+    try {
+      const next = await invoke<Project>('reopen_project', { projectId })
+      await loadProject(next)
+    } catch (error) {
+      showNotice(`Could not reopen project: ${String(error)}`)
     } finally {
       setProjectBusy(false)
     }
@@ -640,51 +716,57 @@ function App() {
 
   return (
     <main className="app-shell">
-      <header className="topbar">
-        <div className="brand-area">
-          <div className="brand-mark"><Workflow size={19} strokeWidth={2.4} /></div>
-          <span className="brand-name">Heim</span>
-        </div>
-
-        <div className="topbar-actions">
-          {project && <button
-            className="button button-development"
-            type="button"
-            onClick={startDevelopment}
-            disabled={!project || !agentVersion || agentRunning || draftReviewActive || mapDirty || !developmentReady || !developmentNode || unansweredQuestions(developmentNode.data).length > 0}
-            title={!developmentReady ? 'Approve a map before development' : developmentNode && unansweredQuestions(developmentNode.data).length > 0 ? 'Answer all node questions before development' : 'Develop the selected node in a new Agent session'}
-          >
-            <Code2 size={15} /> Develop next unit
-          </button>}
-          <button className="avatar-button" type="button" aria-label="User profile">J</button>
-        </div>
-      </header>
-
-      <div className={`workspace${project ? '' : ' startup-workspace'}`}>
-        {!project ? (
-          <section className="startup-screen" aria-label="Start Heim">
-            <div className="startup-card">
-              <div className="startup-icon"><Workflow size={30} /></div>
-              <h1>Start with a project</h1>
-              <p>Open an existing project folder or begin a new design from an empty folder.</p>
-              <div className="startup-actions">
-                <button className="button button-primary" type="button" onClick={chooseProject} disabled={backendStatus.kind !== 'ready' || projectBusy}>Open folder</button>
-                <button className="button button-outline" type="button" onClick={chooseProject} disabled={backendStatus.kind !== 'ready' || projectBusy}>Start new project</button>
-              </div>
-              <small>{backendStatus.kind === 'ready' ? 'Your project files stay on this computer.' : 'Desktop backend is connecting…'}</small>
+      <div className={`workspace${!project ? ' startup-workspace' : isChatStart ? ' chat-start-workspace' : ` has-project-sidebar${projectSidebarCollapsed ? ' is-sidebar-collapsed' : ''}`}`}>
+        {!project ? <section className="startup-screen" aria-label="Start Heim">
+          <div className="startup-card">
+            <div className="startup-icon"><Workflow size={30} /></div>
+            <h1>Start with a project</h1>
+            <p>Open an existing project folder or begin a new design from an empty folder.</p>
+            <div className="startup-actions">
+              <button className="button button-primary" type="button" onClick={chooseProject} disabled={backendStatus.kind !== 'ready' || projectBusy}>Open folder</button>
+              <button className="button button-outline" type="button" onClick={chooseProject} disabled={backendStatus.kind !== 'ready' || projectBusy}>Start new project</button>
             </div>
-          </section>
-        ) : <>
-
-        <section ref={mainColumnRef} className={`main-column${resizingAgentPanel ? ' is-resizing' : ''}`} style={{ gridTemplateRows: `72px minmax(250px, 1fr) ${agentPanelHeight}px` }} aria-label="Project map and agent workspace">
+            <small>{backendStatus.kind === 'ready' ? 'Your project files stay on this computer.' : 'Desktop backend is connecting…'}</small>
+          </div>
+        </section> : <>
+        {!isChatStart && <aside className="recent-project-sidebar" aria-label="Project folders">
+          <div className="project-sidebar-header">
+            {!projectSidebarCollapsed && <span>Projects</span>}
+            <button className="project-sidebar-toggle" type="button" onClick={() => setProjectSidebarCollapsed((collapsed) => !collapsed)} aria-label={projectSidebarCollapsed ? 'Expand project sidebar' : 'Collapse project sidebar'} title={projectSidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}>
+              {projectSidebarCollapsed ? <ChevronRight size={17} /> : <ChevronLeft size={17} />}
+            </button>
+          </div>
+          <div className="recent-project-list">
+            {recentProjects.map((recent) => (
+              <button
+                className={`recent-project-item${project.id === recent.id ? ' is-active' : ''}`}
+                type="button"
+                key={recent.id}
+                onClick={() => void openRecentProject(recent.id)}
+                disabled={projectBusy}
+                title={recent.root}
+              >
+                <span><strong>{recent.name}</strong><small>{recent.root}</small></span>
+              </button>
+            ))}
+          </div>
+        </aside>}
+        <section ref={mainColumnRef} className={`main-column${resizingAgentPanel ? ' is-resizing' : ''}${isChatStart ? ' is-chat-start' : ''}`} style={{ gridTemplateRows: isChatStart ? 'minmax(0, 1fr)' : `72px minmax(180px, 1fr) ${agentPanelHeight}px` }} aria-label="Project map and agent workspace">
+          {isChatStart && project && <div className="chat-start-project-floating">{projectMenuControl}</div>}
           <div className="map-toolbar">
             <div className="map-heading-icon"><Workflow size={21} /></div>
-            <div className="map-heading-copy">
-              <h1>Project Map</h1>
-              <p>Explore the shared plan and discuss each part with your agent.</p>
-            </div>
+            <div className="map-heading-copy">{!isChatStart && projectMenuControl}</div>
             <div className="map-toolbar-actions">
-              <button className="button button-outline" type="button" onClick={chooseProject} disabled={backendStatus.kind !== 'ready' || projectBusy}>Open folder</button>
+              {project && <button
+                className="button button-development"
+                type="button"
+                onClick={startDevelopment}
+                disabled={!agentVersion || agentRunning || draftReviewActive || mapDirty || !developmentReady || !developmentNode || unansweredQuestions(developmentNode.data).length > 0}
+                title={!developmentReady ? 'Approve a map before development' : developmentNode && unansweredQuestions(developmentNode.data).length > 0 ? 'Answer all node questions before development' : 'Develop the selected node in a new Agent session'}
+                aria-label="Develop next unit"
+              >
+                <Code2 size={15} /> <span className="develop-label">Develop next unit</span>
+              </button>}
               {!draftReviewActive && <button className="button button-outline" type="button" onClick={addNode} disabled={!project || projectBusy}>
                 <Plus size={16} /> Add node
               </button>}
@@ -732,11 +814,12 @@ function App() {
               nodesConnectable={!!project && !projectBusy && !draftReviewActive}
               nodesDraggable={!!project && !projectBusy && !draftReviewActive}
               elementsSelectable
-              proOptions={{ hideAttribution: false }}
+              proOptions={{ hideAttribution: true }}
             >
               <Background variant={BackgroundVariant.Dots} gap={18} size={1} color="#dce2ec" />
               <Controls showInteractive={false} />
               <MiniMap
+                style={{ width: 160, height: 120 }}
                 pannable
                 zoomable
                 nodeColor={(node) => node.type === 'layer' ? '#e6eaf2' : '#dce7ff'}
@@ -747,7 +830,6 @@ function App() {
               {nodes.length > 0 && <section className="draft-graph-pane"><header><strong>Before · confirmed map</strong><span>현재 확정된 지도</span></header><ReactFlow nodes={nodes} edges={edges.map((edge) => ({ ...edge, label: undefined }))} nodeTypes={nodeTypes} fitView fitViewOptions={{ padding: 0.18 }} nodesDraggable={false} nodesConnectable={false} elementsSelectable={false} zoomOnDoubleClick={false} panOnDrag><Background variant={BackgroundVariant.Dots} gap={18} size={1} color="#dce2ec" /></ReactFlow></section>}
               <section className="draft-graph-pane draft-after-pane"><header><div><strong>After · draft v{designDraft.version}</strong><span>{draftEdit.nodes.length}개 노드 · {draftEdit.edges.length}개 관계 · 노드를 눌러 상세 확인</span></div><button className="button button-primary" type="button" onClick={() => resolveDesignDraft(true)} disabled={draftEditDirty || projectBusy || agentRunning}>Approve map</button></header><ReactFlow nodes={draftEdit.nodes} edges={draftEdit.edges.map((edge) => ({ ...edge, label: undefined }))} nodeTypes={nodeTypes} fitView fitViewOptions={{ padding: 0.18 }} nodesDraggable={false} nodesConnectable={false} onNodeClick={(_, node) => { if (node.type === 'component') setDraftSelectedNodeId(node.id) }}><Background variant={BackgroundVariant.Dots} gap={18} size={1} color="#dce2ec" /><Controls showInteractive={false} /></ReactFlow><div className="draft-graph-footer">{draftEditDirty ? 'Save edits in the node details panel before approving.' : 'Select a node to edit its name, description, or open questions.'}<button className="button button-outline" type="button" onClick={() => resolveDesignDraft(false)} disabled={draftEditDirty || projectBusy || agentRunning}>Reject draft</button><button className="button button-outline" type="button" onClick={saveDraftEdits} disabled={!draftEditDirty || projectBusy || agentRunning}>Save edits</button></div></section>
             </div>}
-            <div className="preview-watermark">{project ? (mapDirty ? 'Unsaved project map' : project.name) : 'Sample project map'}</div>
           </div>
 
           <section className="agent-panel" aria-label="Agent workspace">
@@ -782,19 +864,11 @@ function App() {
               </div>
             </div>
 
-            {activeWorkspaceTab === 'chat' && (
-              <div className="chat-panel">
+            {(isChatStart || activeWorkspaceTab === 'chat') && (
+              <div className={`chat-panel${showChatStarter ? ' chat-panel-starter' : ''}`}>
                 <div className="chat-messages" aria-live="polite">
-                  {messages.length === 0 ? (
-                    <div className="chat-empty-state">
-                      <div className="empty-state-icon"><Sparkles size={17} /></div>
-                      <div>
-                        <strong>{project && nodes.length === 0 ? 'Describe what you want to build' : 'Discuss this part of your project'}</strong>
-                        <p>{project ? nodes.length === 0 ? 'Your first message creates a read-only design draft. No project code is written.' : 'Select a map node for focused context, then message Codex.' : 'Open a project to chat with the agent.'}</p>
-                      </div>
-                      <span className="preview-note">{agentVersion || agentError || 'Desktop agent required'}</span>
-                    </div>
-                  ) : messages.map((message) => (
+                  {showChatStarter && <div className="chat-start-intro"><h1>무엇을 함께 만들어볼까요?</h1></div>}
+                  {messages.map((message) => (
                     <article className={`chat-message ${message.role}-message`} key={message.id}>
                       <div className="message-avatar">{message.role === 'user' ? 'J' : <Sparkles size={14} />}</div>
                       <div className="message-body">
@@ -849,15 +923,15 @@ function App() {
                   {mapDirty && <small>Save the map first.</small>}
                 </div>}
                 <form className="composer" onSubmit={sendMessage}>
-                  <button className="composer-attach" type="button" disabled title="Attachments are not available yet">
-                    <Plus size={17} />
-                  </button>
+                  {!project
+                    ? <button className="composer-project-button" type="button" onClick={chooseProject} disabled={backendStatus.kind !== 'ready' || projectBusy}><FolderPlus size={15} /> Choose project</button>
+                    : <button className="composer-attach" type="button" disabled title="Attachments are not available yet"><Plus size={17} /></button>}
                   <textarea
                     ref={composerInput}
                     aria-label="Message the selected project component"
                     value={draft}
                     rows={1}
-                    placeholder={draftReviewActive ? 'Ask the Agent to revise the saved draft…' : nodes.length > 0 ? developmentReady ? unansweredQuestions(activeNodeData as ComponentData).length > 0 ? 'Answer the open question in Details to unlock development…' : `Request development for ${activeNodeData?.title ?? 'the selected node'}…` : 'Approve the map before requesting development…' : `Message ${activeNodeData?.title ?? 'the project'}... (⌘ ↵ to send)`}
+                    placeholder={!project ? 'Choose a project folder to start chatting' : showChatStarter ? '만들고 싶은 것을 편하게 설명해 주세요' : draftReviewActive ? 'Ask the Agent to revise the saved draft…' : nodes.length > 0 ? developmentReady ? unansweredQuestions(activeNodeData as ComponentData).length > 0 ? 'Answer the open question in Details to unlock development…' : `Request development for ${activeNodeData?.title ?? 'the selected node'}…` : 'Approve the map before requesting development…' : `Message ${activeNodeData?.title ?? 'the project'}... (⌘ ↵ to send)`}
                     disabled={!project || !agentVersion || agentRunning || reviewingMap || draftEditDirty || mapProposals.length > 0 || !!reviewError || (nodes.length > 0 && (!developmentReady || !selectedNode))}
                     onChange={(event) => setDraft(event.target.value)}
                     onKeyDown={handleComposerKeyDown}
@@ -870,7 +944,7 @@ function App() {
             )}
 
 
-            {activeWorkspaceTab === 'terminal' && (
+            {!isChatStart && activeWorkspaceTab === 'terminal' && (
               <div className="workspace-content terminal-content">
                 <div className="terminal-heading"><SquareTerminal size={17} /><strong>Agent activity</strong><span className="terminal-state">{agentRunning ? 'Running' : 'Idle'}</span></div>
                 {messages.filter((message) => message.role === 'status').map((message) => <p key={message.id}>{message.text}</p>)}
@@ -880,7 +954,7 @@ function App() {
           </section>
         </section>
 
-        <aside className={`details-panel${draftReviewActive ? ' draft-details-panel' : ''}`} aria-label="Selected component details">
+        {!isChatStart && project && <aside className={`details-panel${draftReviewActive ? ' draft-details-panel' : ''}`} aria-label="Selected component details">
           <div className="details-summary">
             <div className="details-icon">{draftSelectedNode?.type === 'component' ? <AlertCircle size={23} /> : activeNodeData ? (() => { const Icon = iconByName[activeNodeData.icon]; return <Icon size={23} /> })() : <Workflow size={23} />}</div>
             <div className="details-title-copy">
@@ -972,9 +1046,15 @@ function App() {
           </div>
 
 
-        </aside>
+        </aside>}
         </>}
       </div>
+
+      {project && !isChatStart && projectSidebarCollapsed && <div className="sidebar-reopen-hotspot">
+        <button className="sidebar-reopen-button" type="button" onClick={() => setProjectSidebarCollapsed(false)} aria-label="Expand project sidebar" title="Expand project sidebar">
+          <ChevronRight size={18} />
+        </button>
+      </div>}
 
       {notice && <div className="toast-notice" role="status"><Check size={16} />{notice}<button type="button" onClick={() => setNotice('')} aria-label="Dismiss notification"><X size={15} /></button></div>}
     </main>

@@ -209,6 +209,25 @@ fn reopen_project(app: tauri::AppHandle, project_id: i64) -> Result<Project, Str
 }
 
 #[tauri::command]
+fn project_has_content(app: tauri::AppHandle, project_id: i64) -> Result<bool, String> {
+    let conn = database(&app)?;
+    ensure_project(&conn, project_id)?;
+    let root: String = conn
+        .query_row(
+            "SELECT root FROM projects WHERE id = ?1",
+            [project_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let mut entries = fs::read_dir(root).map_err(|error| error.to_string())?;
+    entries
+        .next()
+        .transpose()
+        .map(|entry| entry.is_some())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn load_project_map(app: tauri::AppHandle, project_id: i64) -> Result<ProjectMap, String> {
     let conn = database(&app)?;
     ensure_project(&conn, project_id)?;
@@ -803,6 +822,7 @@ pub fn run() {
             open_project,
             recent_projects,
             reopen_project,
+            project_has_content,
             load_project_map,
             save_project_map,
             create_design_draft,

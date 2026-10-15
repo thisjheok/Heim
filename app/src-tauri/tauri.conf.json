@@ -5,7 +5,7 @@
   "identifier": "com.heim.desktop",
   "build": {
     "frontendDist": "../dist",
-    "devUrl": "http://127.0.0.1:1420",
+    "devUrl": "http://127.0.0.1:5180",
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build"
   },
@@ -22,7 +22,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src ipc: http://ipc.localhost http://127.0.0.1:1420 ws://127.0.0.1:1420"
+      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src ipc: http://ipc.localhost http://127.0.0.1:5180 ws://127.0.0.1:5180"
     }
   },
   "bundle": {

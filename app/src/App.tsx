@@ -2,18 +2,17 @@ import { useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEven
 import { invoke, isTauri } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import {
-  addEdge,
   Background,
   BackgroundVariant,
   Controls,
   Handle,
+  MarkerType,
   MiniMap,
   Position,
   ReactFlow,
   useEdgesState,
   useNodesState,
   type Connection,
-  type Edge,
   type Node,
   type NodeProps,
   type ReactFlowInstance,
@@ -34,6 +33,7 @@ import {
   GitBranch,
   LayoutGrid,
   Link2,
+  LoaderCircle,
   ListChecks,
 
   MessageCircle,
@@ -51,10 +51,13 @@ import {
 import {
   initialEdges,
   initialNodes,
+  relationLabel,
   type ComponentData,
   type ComponentIcon,
+  type HeimEdge,
   type HeimNode,
   type LayerData,
+  type MapRelation,
 } from './data/projectMap'
 import '@xyflow/react/dist/style.css'
 import './App.css'
@@ -73,8 +76,10 @@ type MapProposal = { id: number; projectId: number; baseRevision: number; change
 } }
 type RuntimeInfo = { version: string; platform: string }
 type Project = { id: number; name: string; root: string }
-type StoredMap = { nodes: HeimNode[]; edges: Edge[]; revision: number }
-type DesignDraft = { id: number; projectId: number; baseRevision: number; version: number; draft: { goal: string; nodes: HeimNode[]; edges: Edge[]; questions: string[]; assumptions: string[] } }
+type StoredMap = { nodes: HeimNode[]; edges: HeimEdge[]; revision: number }
+type DesignDraft = { id: number; projectId: number; baseRevision: number; version: number; draft: { goal: string; nodes: HeimNode[]; edges: HeimEdge[]; questions: string[]; assumptions: string[] } }
+type MapEditDraftResult = { draft: DesignDraft; confirmedMap: StoredMap }
+type DevelopmentUnit = { id: number; projectId: number; mapRevision: number; nodeId: string; goal: string; completionCriteria: string[]; status: 'confirmed' | 'started' | 'start_failed'; statusDetail: string | null; createdAt: string; startedAt: string | null }
 type BackendStatus =
   | { kind: 'checking' | 'browser' }
   | { kind: 'ready'; info: RuntimeInfo }
@@ -88,6 +93,11 @@ const componentTitle = (nodes: HeimNode[], id: string) => {
 const unansweredQuestions = (data: ComponentData) =>
   (data.questions ?? []).filter((question) => !(data.answers?.[question] ?? '').trim())
 
+const edgeForDisplay = (edge: HeimEdge): HeimEdge => ({
+  ...edge,
+  label: edge.data?.relation ? relationLabel(edge.data.relation) : 'Classify relationship',
+})
+
 const iconByName: Record<ComponentIcon, LucideIcon> = {
   desktop: Monitor,
   map: Workflow,
@@ -99,12 +109,19 @@ const iconByName: Record<ComponentIcon, LucideIcon> = {
   review: ClipboardList,
 }
 
+const nodeHandlePositions = [
+  { side: 'top', position: Position.Top },
+  { side: 'right', position: Position.Right },
+  { side: 'bottom', position: Position.Bottom },
+  { side: 'left', position: Position.Left },
+] as const
+
 function ComponentNodeView({ data, selected }: NodeProps<ComponentFlowNode>) {
   const Icon = iconByName[data.icon]
 
   return (
     <div className={`component-node${selected ? ' is-selected' : ''}`}>
-      <Handle type="target" position={Position.Left} />
+      {nodeHandlePositions.map(({ side, position }) => <Handle key={`target-${side}`} id={`target-${side}`} className={`node-handle node-handle-target node-handle-${side}`} type="target" position={position} />)}
       <div className="component-node-icon">
         <Icon size={18} strokeWidth={1.8} />
       </div>
@@ -115,7 +132,7 @@ function ComponentNodeView({ data, selected }: NodeProps<ComponentFlowNode>) {
       </div>
       {unansweredQuestions(data).length > 0 && <span className="node-question-badge" title="Unresolved question"><AlertCircle size={13} /></span>}
       <span className={`node-status-dot ${data.status === 'In progress' ? 'is-active' : ''}`} />
-      <Handle type="source" position={Position.Right} />
+      {nodeHandlePositions.map(({ side, position }) => <Handle key={`source-${side}`} id={`source-${side}`} className={`node-handle node-handle-source node-handle-${side}`} type="source" position={position} />)}
     </div>
   )
 }
@@ -147,7 +164,9 @@ const detailTabs: { id: DetailTab; label: string }[] = [
 
 function App() {
   const [nodes, setNodes, onNodesChange] = useNodesState<HeimNode>(initialNodes)
-  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(initialEdges)
+  const [edges, setEdges, onEdgesChange] = useEdgesState<HeimEdge>(initialEdges)
+  const [newEdgeRelation, setNewEdgeRelation] = useState<MapRelation | ''>('')
+  const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null)
   const [selectedNodeId, setSelectedNodeId] = useState('project-map')
   const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<WorkspaceTab>('chat')
   const [activeDetailTab, setActiveDetailTab] = useState<DetailTab>('overview')
@@ -156,6 +175,7 @@ function App() {
   const [agentVersion, setAgentVersion] = useState('')
   const [agentError, setAgentError] = useState('')
   const [agentRunning, setAgentRunning] = useState(false)
+  const [initialDesignPending, setInitialDesignPending] = useState(false)
   const [approvals, setApprovals] = useState<Approval[]>([])
   const [changedFiles, setChangedFiles] = useState<string[]>([])
   const [mapProposals, setMapProposals] = useState<MapProposal[]>([])
@@ -163,7 +183,13 @@ function App() {
   const [draftEdit, setDraftEdit] = useState<DesignDraft['draft'] | null>(null)
   const [draftEditDirty, setDraftEditDirty] = useState(false)
   const [draftSelectedNodeId, setDraftSelectedNodeId] = useState('')
+  const [draftSelectedPane, setDraftSelectedPane] = useState<'before' | 'after'>('after')
   const [developmentReady, setDevelopmentReady] = useState(false)
+  const [developmentUnits, setDevelopmentUnits] = useState<DevelopmentUnit[]>([])
+  const [developmentUnitOpen, setDevelopmentUnitOpen] = useState(false)
+  const [developmentUnitNodeId, setDevelopmentUnitNodeId] = useState('')
+  const [developmentUnitGoal, setDevelopmentUnitGoal] = useState('')
+  const [developmentUnitCriteria, setDevelopmentUnitCriteria] = useState('')
   const [reviewFiles, setReviewFiles] = useState<string[]>([])
   const [reviewingMap, setReviewingMap] = useState(false)
   const [reviewError, setReviewError] = useState('')
@@ -179,20 +205,20 @@ function App() {
   const [editingNodeId, setEditingNodeId] = useState<string | null>(null)
   const [nodeTitle, setNodeTitle] = useState('')
   const [nodeSummary, setNodeSummary] = useState('')
+  const [nodeResponsibilities, setNodeResponsibilities] = useState('')
   const [projectBusy, setProjectBusy] = useState(false)
   const [agentPanelHeight, setAgentPanelHeight] = useState(300)
   const [resizingAgentPanel, setResizingAgentPanel] = useState(false)
   const mainColumnRef = useRef<HTMLElement | null>(null)
   const projectMenuRef = useRef<HTMLDivElement | null>(null)
-  const [flow, setFlow] = useState<ReactFlowInstance<HeimNode, Edge> | null>(null)
+  const [flow, setFlow] = useState<ReactFlowInstance<HeimNode, HeimEdge> | null>(null)
   const noticeTimer = useRef<number | undefined>(undefined)
   const composerInput = useRef<HTMLTextAreaElement>(null)
-  const mapChangeCount = useRef(0)
   const mapDirtyRef = useRef(false)
   const projectId = project?.id
-  const draftReviewActive = !!designDraft && nodes.length === 0
+  const draftReviewActive = !!designDraft
   const isChatStart = !!project && nodes.length === 0 && !designDraft && !projectHasContent
-  const showChatStarter = isChatStart && messages.length === 0
+  const showChatStarter = isChatStart && (messages.length === 0 || initialDesignPending)
 
   const projectMenuControl = (
     <div className="project-menu-anchor" ref={projectMenuRef}>
@@ -345,20 +371,16 @@ function App() {
     (node): node is ComponentFlowNode =>
       node.id === selectedNodeId && node.type === 'component',
   )
-  const developmentNode = selectedNode ?? nodes.find((node): node is ComponentFlowNode => node.type === 'component')
+  const developmentNode = nodes.find((node): node is ComponentFlowNode => node.type === 'component' && node.id === developmentUnitNodeId)
+  const completionCriteria = developmentUnitCriteria.split(/\r?\n/).map((criterion) => criterion.trim()).filter(Boolean)
 
-  const relatedNodes = useMemo(() => {
-    const relatedIds = new Set(
-      edges
-        .filter((edge) => edge.source === selectedNodeId || edge.target === selectedNodeId)
-        .flatMap((edge) => [edge.source, edge.target])
-        .filter((id) => id !== selectedNodeId),
-    )
-
-    return nodes.filter(
-      (node): node is ComponentFlowNode =>
-        relatedIds.has(node.id) && node.type === 'component',
-    )
+  const relatedRelationships = useMemo(() => {
+    return edges.flatMap((edge) => {
+      if (edge.source !== selectedNodeId && edge.target !== selectedNodeId) return []
+      const relatedId = edge.source === selectedNodeId ? edge.target : edge.source
+      const node = nodes.find((item): item is ComponentFlowNode => item.id === relatedId && item.type === 'component')
+      return node ? [{ edge, node, selectedIsSource: edge.source === selectedNodeId }] : []
+    })
   }, [edges, nodes, selectedNodeId])
 
   const showNotice = (message: string) => {
@@ -368,7 +390,6 @@ function App() {
   }
 
   const markMapDirty = () => {
-    mapChangeCount.current += 1
     mapDirtyRef.current = true
     setMapDirty(true)
   }
@@ -377,20 +398,24 @@ function App() {
     const map = await invoke<StoredMap>('load_project_map', { projectId: next.id })
     const pendingDraft = await invoke<DesignDraft | null>('pending_design_draft', { projectId: next.id })
     const canDevelop = await invoke<boolean>('development_ready', { projectId: next.id })
+    const units = await invoke<DevelopmentUnit[]>('project_development_units', { projectId: next.id })
     const hasContent = await invoke<boolean>('project_has_content', { projectId: next.id })
     setNodes(map.nodes)
     setEdges(map.edges)
+    setSelectedEdgeId(null)
+    setNewEdgeRelation('')
     setProject(next)
     setProjectHasContent(hasContent)
     setDesignDraft(pendingDraft)
     setDraftEdit(pendingDraft?.draft ?? null)
     setDraftSelectedNodeId(pendingDraft?.draft.nodes[0]?.id ?? '')
+    setDraftSelectedPane('after')
     setDraftEditDirty(false)
     setDevelopmentReady(canDevelop)
+    setDevelopmentUnits(units)
     setMapRevision(map.revision)
     setMapDirty(false)
     mapDirtyRef.current = false
-    mapChangeCount.current = 0
     setSelectedNodeId(map.nodes.find((node) => node.type === 'component')?.id ?? '')
     setMessages([])
     setChangedFiles([])
@@ -406,6 +431,7 @@ function App() {
   }
 
   const confirmSwitch = () => {
+    if (initialDesignPending) { showNotice('Wait for the initial architecture map to finish before switching projects.'); return false }
     if (agentRunning) { showNotice('Cancel the running agent turn before switching projects.'); return false }
     return (!mapDirty && !draftEditDirty) || window.confirm('Unsaved map or design draft edits will be lost. Continue?')
   }
@@ -437,30 +463,39 @@ function App() {
   }
 
 
-  const saveMap = async (): Promise<boolean> => {
-    if (!project || !mapDirty) return true
+  const saveMapDraft = async () => {
+    if (!project || !mapDirty || designDraft) return
     setProjectBusy(true)
-    const currentChangeCount = mapChangeCount.current
-    const wasDevelopmentReady = developmentReady
     try {
-      const revision = await invoke<number>('save_project_map', {
+      const result = await invoke<MapEditDraftResult>('create_map_edit_draft', {
         projectId: project.id,
         map: {
           nodes: nodes.map(({ id, type, position, data, style, draggable, selectable, connectable, zIndex }) =>
             ({ id, type, position, data, style, draggable, selectable, connectable, zIndex })),
-          edges: edges.map(({ id, source, target, sourceHandle, targetHandle, style, markerEnd }) =>
-            ({ id, source, target, sourceHandle, targetHandle, style, markerEnd })),
+          edges: edges.map(({ id, source, target, sourceHandle, targetHandle, style, markerEnd, data }) =>
+            ({ id, source, target, sourceHandle, targetHandle, style, markerEnd, data })),
           revision: mapRevision,
         },
       })
-      setMapRevision(revision)
-      setDevelopmentReady(wasDevelopmentReady)
-      if (mapChangeCount.current === currentChangeCount) { setMapDirty(false); mapDirtyRef.current = false }
-      showNotice('Project map saved.')
-      return true
+      setNodes(result.confirmedMap.nodes)
+      setEdges(result.confirmedMap.edges)
+      setMapRevision(result.confirmedMap.revision)
+      setSelectedNodeId((current) => result.confirmedMap.nodes.some((node) => node.id === current)
+        ? current
+        : result.confirmedMap.nodes.find((node) => node.type === 'component')?.id ?? '')
+      setSelectedEdgeId(null)
+      setNewEdgeRelation('')
+      setMapDirty(false)
+      mapDirtyRef.current = false
+      setEditingNodeId(null)
+      setDesignDraft(result.draft)
+      setDraftEdit(result.draft.draft)
+      setDraftSelectedNodeId(result.draft.draft.nodes.find((node) => node.type === 'component')?.id ?? '')
+      setDraftSelectedPane('after')
+      setDraftEditDirty(false)
+      showNotice('Map edits saved as a draft. The confirmed map is unchanged.')
     } catch (error) {
-      showNotice(`Could not save map: ${String(error)}`)
-      return false
+      showNotice(`Could not save map draft: ${String(error)}`)
     } finally {
       setProjectBusy(false)
     }
@@ -512,7 +547,7 @@ function App() {
         mapDirtyRef.current = false
         setMapDirty(false)
         setDevelopmentReady(true)
-      } else {
+      } else if (nodes.length === 0) {
         setDevelopmentReady(false)
       }
       setDesignDraft(null)
@@ -547,8 +582,8 @@ function App() {
       position: { x: 430 + (offset % 3) * 35, y: 340 + Math.floor(offset / 3) * 35 },
       data: {
         title: 'New component',
-        kind: 'Proposed component',
-        summary: 'Describe what this part of the project is responsible for.',
+        kind: 'System responsibility',
+        summary: 'Describe this system responsibility and what is outside its scope.',
         technology: 'Not decided',
         status: 'Draft',
         icon: 'map',
@@ -568,44 +603,96 @@ function App() {
     setEditingNodeId(selectedNode.id)
     setNodeTitle(selectedNode.data.title)
     setNodeSummary(selectedNode.data.summary)
+    setNodeResponsibilities(selectedNode.data.responsibilities.join('\n'))
     setActiveDetailTab('overview')
   }
 
   const updateNode = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
-    if (!editingNodeId || !nodeTitle.trim() || !project) return
+    if (projectBusy) return
+    const responsibilities = nodeResponsibilities.split('\n').map((item) => item.trim()).filter(Boolean)
+    if (!editingNodeId || !nodeTitle.trim() || !nodeSummary.trim() || responsibilities.length === 0 || !project) return
     setNodes((current) => current.map((node) => node.id === editingNodeId && node.type === 'component'
-      ? { ...node, data: { ...node.data, title: nodeTitle.trim(), summary: nodeSummary.trim() } }
+      ? { ...node, data: { ...node.data, title: nodeTitle.trim(), summary: nodeSummary.trim(), responsibilities } }
       : node))
     markMapDirty()
     setEditingNodeId(null)
   }
 
   const handleConnect = (connection: Connection) => {
-    if (!project || connection.source === connection.target) return
-    setEdges((current) => addEdge(connection, current))
+    const { source, target } = connection
+    if (!project || !newEdgeRelation || !source || !target || source === target) return
+    const label = relationLabel(newEdgeRelation)
+    setEdges((current) => [...current, {
+      id: crypto.randomUUID(),
+      source,
+      target,
+      sourceHandle: connection.sourceHandle,
+      targetHandle: connection.targetHandle,
+      type: 'smoothstep',
+      data: { relation: newEdgeRelation },
+      label,
+      style: { stroke: '#aeb8c9', strokeWidth: 1.6 },
+      markerEnd: { type: MarkerType.ArrowClosed, color: '#aeb8c9' },
+    }])
+    setSelectedEdgeId(null)
+    setNewEdgeRelation('')
     markMapDirty()
   }
 
+  const openDevelopmentUnit = () => {
+    if (!project || !agentVersion || agentRunning || draftReviewActive || mapDirty || !developmentReady) return
+    setDevelopmentUnitNodeId('')
+    setDevelopmentUnitGoal('')
+    setDevelopmentUnitCriteria('')
+    setDevelopmentUnitOpen(true)
+  }
+
   const startDevelopment = async () => {
-    if (!project || !agentVersion || agentRunning || draftReviewActive || mapDirty || !developmentReady || !developmentNode || unansweredQuestions(developmentNode.data).length > 0) return
+    if (!project || !agentVersion || agentRunning || draftReviewActive || mapDirty || !developmentReady || !developmentNode || !developmentUnitGoal.trim() || completionCriteria.length === 0 || unansweredQuestions(developmentNode.data).length > 0) return
     setAgentRunning(true)
-    setMessages((current) => [...current, { id: crypto.randomUUID(), role: 'status', text: `Starting development for ${developmentNode.data.title} in a new Agent session.`, time: new Date().toLocaleTimeString() }])
     try {
-      await invoke('send_development_message', { projectId: project.id, nodeId: developmentNode.id, text: 'Proceed with the next development unit for the selected component. Implement only this component using the confirmed map context.' })
+      const unitId = await invoke<number>('send_development_message', {
+        projectId: project.id,
+        mapRevision,
+        nodeId: developmentNode.id,
+        goal: developmentUnitGoal.trim(),
+        completionCriteria,
+      })
+      setDevelopmentUnits((current) => [{
+        id: unitId,
+        projectId: project.id,
+        mapRevision,
+        nodeId: developmentNode.id,
+        goal: developmentUnitGoal.trim(),
+        completionCriteria,
+        status: 'started',
+        statusDetail: null,
+        createdAt: new Date().toISOString(),
+        startedAt: new Date().toISOString(),
+      }, ...current])
+      setMessages((current) => [...current, { id: crypto.randomUUID(), role: 'status', text: `Started development unit #${unitId} for ${developmentNode.data.title} against map revision ${mapRevision}.`, time: new Date().toLocaleTimeString() }])
+      setDevelopmentUnitOpen(false)
     } catch (error) {
       setAgentRunning(false)
       setMessages((current) => [...current, { id: crypto.randomUUID(), role: 'status', text: `Could not start development: ${String(error)}`, time: new Date().toLocaleTimeString() }])
+      void invoke<DevelopmentUnit[]>('project_development_units', { projectId: project.id })
+        .then(setDevelopmentUnits)
+        .catch((refreshError: unknown) => setAgentError(`Could not refresh development units: ${String(refreshError)}`))
     }
   }
 
   const sendMessage = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const text = draft.trim()
-    if (!text || !project || !agentVersion || agentRunning || reviewingMap || draftEditDirty || mapProposals.length > 0 || reviewError || (nodes.length > 0 && (!selectedNode || !developmentReady))) return
-    if (mapDirty && !(await saveMap())) return
+    if (!text || !project || !agentVersion || agentRunning || initialDesignPending || reviewingMap || draftEditDirty || mapProposals.length > 0 || reviewError || (nodes.length > 0 && !draftReviewActive && (!selectedNode || !developmentReady))) return
+    if (mapDirty) {
+      showNotice('Save map edits as a draft and review them before sending a chat message.')
+      return
+    }
 
     const creatingDraft = nodes.length === 0 && !designDraft
+    if (creatingDraft) setInitialDesignPending(true)
     const id = crypto.randomUUID()
     setMessages((current) => [
       ...current,
@@ -619,14 +706,16 @@ function App() {
         }).format(new Date()),
       },
     ])
-    setDraft('')
+    if (!creatingDraft) setDraft('')
     setAgentRunning(true)
     try {
       if (creatingDraft) {
         const savedDraft = await invoke<DesignDraft>('create_design_draft', { projectId: project.id, description: text })
         setDesignDraft(savedDraft)
+        setDraft('')
         setDraftEdit(savedDraft.draft)
         setDraftSelectedNodeId(savedDraft.draft.nodes[0]?.id ?? '')
+        setDraftSelectedPane('after')
         setDraftEditDirty(false)
         setMessages((current) => [...current, { id: crypto.randomUUID(), role: 'status', text: `Design draft v${savedDraft.version} saved for review. The confirmed map is unchanged.`, time: new Date().toLocaleTimeString() }])
       } else if (draftReviewActive && designDraft) {
@@ -639,6 +728,7 @@ function App() {
         setDesignDraft(revisedDraft)
         setDraftEdit(revisedDraft.draft)
         setDraftSelectedNodeId(revisedDraft.draft.nodes[0]?.id ?? '')
+        setDraftSelectedPane('after')
         setDraftEditDirty(false)
         setMessages((current) => [...current, { id: crypto.randomUUID(), role: 'status', text: `Agent revision saved as draft v${revisedDraft.version}. The confirmed map is unchanged.`, time: new Date().toLocaleTimeString() }])
       } else {
@@ -647,6 +737,8 @@ function App() {
     } catch (error) {
       setAgentRunning(false)
       setMessages((current) => [...current, { id: crypto.randomUUID(), role: 'status', text: `Could not send message: ${String(error)}`, time: new Date().toLocaleTimeString() }])
+    } finally {
+      if (creatingDraft) setInitialDesignPending(false)
     }
   }
 
@@ -679,7 +771,7 @@ function App() {
 
   const decideMapProposal = async (accept: boolean) => {
     const proposal = mapProposals[0]
-    if (!project || !proposal || (accept && mapDirty)) return
+    if (!project || !proposal || (accept && (mapDirty || draftReviewActive))) return
     setProjectBusy(true)
     try {
       const map = await invoke<StoredMap | null>('resolve_map_proposal', { projectId: project.id, proposalId: proposal.id, accept })
@@ -712,7 +804,10 @@ function App() {
   }
 
   const activeNodeData = selectedNode?.data
+  const beforeSelectedNode = nodes.find((node) => node.id === draftSelectedNodeId)
   const draftSelectedNode = draftEdit?.nodes.find((node) => node.id === draftSelectedNodeId)
+  const activeDraftNode = draftSelectedPane === 'before' ? beforeSelectedNode : draftSelectedNode
+  const DraftNodeIcon = activeDraftNode?.type === 'component' ? iconByName[activeDraftNode.data.icon] : null
 
   return (
     <main className="app-shell">
@@ -760,17 +855,41 @@ function App() {
               {project && <button
                 className="button button-development"
                 type="button"
-                onClick={startDevelopment}
-                disabled={!agentVersion || agentRunning || draftReviewActive || mapDirty || !developmentReady || !developmentNode || unansweredQuestions(developmentNode.data).length > 0}
-                title={!developmentReady ? 'Approve a map before development' : developmentNode && unansweredQuestions(developmentNode.data).length > 0 ? 'Answer all node questions before development' : 'Develop the selected node in a new Agent session'}
-                aria-label="Develop next unit"
+                onClick={openDevelopmentUnit}
+                disabled={!agentVersion || agentRunning || draftReviewActive || mapDirty || projectBusy || !developmentReady}
+                title={!developmentReady ? 'Approve a map before defining a development unit' : 'Choose a node, define a goal and completion criteria, then confirm the unit'}
+                aria-label="Define development unit"
               >
-                <Code2 size={15} /> <span className="develop-label">Develop next unit</span>
+                <Code2 size={15} /> <span className="develop-label">Define unit</span>
               </button>}
               {!draftReviewActive && <button className="button button-outline" type="button" onClick={addNode} disabled={!project || projectBusy}>
                 <Plus size={16} /> Add node
               </button>}
-              <button className="button button-primary" type="button" onClick={saveMap} disabled={!project || !mapDirty || projectBusy || draftReviewActive}>Save map</button>
+              {!draftReviewActive && <select
+                className="map-relation-select"
+                aria-label={selectedEdgeId ? 'Relationship type for selected connection' : 'Relationship type for next connection'}
+                value={newEdgeRelation}
+                onChange={(event) => {
+                  const relation = event.target.value as MapRelation | ''
+                  if (selectedEdgeId && relation) {
+                    setEdges((current) => current.map((edge) => edge.id === selectedEdgeId
+                      ? { ...edge, data: { relation }, label: relationLabel(relation) }
+                      : edge))
+                    setSelectedEdgeId(null)
+                    setNewEdgeRelation('')
+                    markMapDirty()
+                  } else {
+                    setNewEdgeRelation(relation)
+                  }
+                }}
+                disabled={!project || projectBusy}
+                title={selectedEdgeId ? 'Choose a type for the selected relationship' : 'Choose the relationship type, then connect two nodes'}
+              >
+                <option value="">{selectedEdgeId ? 'Classify selected edge…' : 'Choose relationship…'}</option>
+                <option value="depends_on">A depends on B →</option>
+                <option value="interacts_with">A interacts with B →</option>
+              </select>}
+              <button className="button button-primary" type="button" onClick={saveMapDraft} disabled={!project || !mapDirty || projectBusy || draftReviewActive}>Save as draft</button>
               <button
                 className="button button-subtle fit-button"
                 type="button"
@@ -786,9 +905,9 @@ function App() {
           </div>
 
           <div className="map-canvas">
-            <ReactFlow<HeimNode, Edge>
+            <ReactFlow<HeimNode, HeimEdge>
               nodes={nodes}
-              edges={edges.map((edge) => ({ ...edge, label: undefined }))}
+              edges={edges.map(edgeForDisplay)}
               nodeTypes={nodeTypes}
               onNodesChange={(changes) => {
                 onNodesChange(changes)
@@ -799,6 +918,10 @@ function App() {
                 if (project && changes.some((change) => change.type === 'remove' || change.type === 'add')) markMapDirty()
               }}
               onConnect={handleConnect}
+              onEdgeClick={(_, edge) => {
+                setSelectedEdgeId(edge.id)
+                setNewEdgeRelation('')
+              }}
               onNodeClick={(_, node) => {
                 if (node.type === 'component') {
                   setSelectedNodeId(node.id)
@@ -811,7 +934,7 @@ function App() {
               minZoom={0.25}
               maxZoom={1.5}
               deleteKeyCode={null}
-              nodesConnectable={!!project && !projectBusy && !draftReviewActive}
+              nodesConnectable={!!project && !!newEdgeRelation && !projectBusy && !draftReviewActive}
               nodesDraggable={!!project && !projectBusy && !draftReviewActive}
               elementsSelectable
               proOptions={{ hideAttribution: true }}
@@ -827,8 +950,8 @@ function App() {
               />
             </ReactFlow>
             {designDraft && draftEdit && <div className={`draft-review-overlay${nodes.length === 0 ? ' is-initial' : ''}`} aria-label="Before and after design draft">
-              {nodes.length > 0 && <section className="draft-graph-pane"><header><strong>Before · confirmed map</strong><span>현재 확정된 지도</span></header><ReactFlow nodes={nodes} edges={edges.map((edge) => ({ ...edge, label: undefined }))} nodeTypes={nodeTypes} fitView fitViewOptions={{ padding: 0.18 }} nodesDraggable={false} nodesConnectable={false} elementsSelectable={false} zoomOnDoubleClick={false} panOnDrag><Background variant={BackgroundVariant.Dots} gap={18} size={1} color="#dce2ec" /></ReactFlow></section>}
-              <section className="draft-graph-pane draft-after-pane"><header><div><strong>After · draft v{designDraft.version}</strong><span>{draftEdit.nodes.length}개 노드 · {draftEdit.edges.length}개 관계 · 노드를 눌러 상세 확인</span></div><button className="button button-primary" type="button" onClick={() => resolveDesignDraft(true)} disabled={draftEditDirty || projectBusy || agentRunning}>Approve map</button></header><ReactFlow nodes={draftEdit.nodes} edges={draftEdit.edges.map((edge) => ({ ...edge, label: undefined }))} nodeTypes={nodeTypes} fitView fitViewOptions={{ padding: 0.18 }} nodesDraggable={false} nodesConnectable={false} onNodeClick={(_, node) => { if (node.type === 'component') setDraftSelectedNodeId(node.id) }}><Background variant={BackgroundVariant.Dots} gap={18} size={1} color="#dce2ec" /><Controls showInteractive={false} /></ReactFlow><div className="draft-graph-footer">{draftEditDirty ? 'Save edits in the node details panel before approving.' : 'Select a node to edit its name, description, or open questions.'}<button className="button button-outline" type="button" onClick={() => resolveDesignDraft(false)} disabled={draftEditDirty || projectBusy || agentRunning}>Reject draft</button><button className="button button-outline" type="button" onClick={saveDraftEdits} disabled={!draftEditDirty || projectBusy || agentRunning}>Save edits</button></div></section>
+              {nodes.length > 0 && <section className="draft-graph-pane"><header><strong>Before · confirmed map</strong><span>노드를 선택하면 확정본 정보가 표시됩니다</span></header><ReactFlow nodes={nodes} edges={edges.map(edgeForDisplay)} nodeTypes={nodeTypes} fitView fitViewOptions={{ padding: 0.18 }} nodesDraggable={false} nodesConnectable={false} onNodeClick={(_, node) => { if (node.type === 'component') { setDraftSelectedNodeId(node.id); setDraftSelectedPane('before') } }} zoomOnDoubleClick={false} panOnDrag><Background variant={BackgroundVariant.Dots} gap={18} size={1} color="#dce2ec" /></ReactFlow></section>}
+              <section className="draft-graph-pane draft-after-pane"><header><div><strong>After · draft v{designDraft.version}</strong><span>{draftEdit.nodes.length}개 노드 · {draftEdit.edges.length}개 관계 · 노드를 눌러 상세 확인</span></div><button className="button button-primary" type="button" onClick={() => resolveDesignDraft(true)} disabled={draftEditDirty || projectBusy || agentRunning}>Approve map</button></header><ReactFlow nodes={draftEdit.nodes} edges={draftEdit.edges.map(edgeForDisplay)} nodeTypes={nodeTypes} fitView fitViewOptions={{ padding: 0.18 }} nodesDraggable={false} nodesConnectable={false} onNodeClick={(_, node) => { if (node.type === 'component') { setDraftSelectedNodeId(node.id); setDraftSelectedPane('after') } }}><Background variant={BackgroundVariant.Dots} gap={18} size={1} color="#dce2ec" /><Controls showInteractive={false} /></ReactFlow><div className="draft-graph-footer">{draftEditDirty ? 'Save edits in the node details panel before approving.' : 'Select a node to edit its name, description, or open questions.'}<button className="button button-outline" type="button" onClick={() => resolveDesignDraft(false)} disabled={draftEditDirty || projectBusy || agentRunning}>Reject draft</button><button className="button button-outline" type="button" onClick={saveDraftEdits} disabled={!draftEditDirty || projectBusy || agentRunning}>Save edits</button></div></section>
             </div>}
           </div>
 
@@ -868,7 +991,7 @@ function App() {
               <div className={`chat-panel${showChatStarter ? ' chat-panel-starter' : ''}`}>
                 <div className="chat-messages" aria-live="polite">
                   {showChatStarter && <div className="chat-start-intro"><h1>무엇을 함께 만들어볼까요?</h1></div>}
-                  {messages.map((message) => (
+                  {!initialDesignPending && messages.map((message) => (
                     <article className={`chat-message ${message.role}-message`} key={message.id}>
                       <div className="message-avatar">{message.role === 'user' ? 'J' : <Sparkles size={14} />}</div>
                       <div className="message-body">
@@ -892,8 +1015,8 @@ function App() {
                 </div>}
                 {nodes.length > 0 && <div className="map-review" role="status">
                   {developmentReady
-                    ? `Approved map revision ${mapRevision}. A development request will be limited to the selected component.`
-                    : 'Development is locked until this map revision has an approved design draft.'}
+                    ? `Approved map revision ${mapRevision}. Define and confirm a target, goal, and completion criteria before starting development.`
+                    : 'Development-unit definition is locked until this map revision has an approved design draft.'}
                 </div>}
                 {draftReviewActive && draftEditDirty && <div className="map-review" role="status">Save your direct After edits before asking the Agent to revise the draft.</div>}
                 {reviewingMap && <div className="map-review" role="status">Agent is comparing the changed code with the project map…</div>}
@@ -912,15 +1035,16 @@ function App() {
                     <strong>Remove {componentTitle(nodes, removal.nodeId)} and its relationships</strong>
                     <small>{removal.deletedFile} — {removal.reason}</small>
                   </div>)}
-                  {mapDirty && <p>Save your map edits before accepting this proposal. If the saved map changed, request a new review.</p>}
+                  {mapDirty && <p>Save your map edits as a draft before accepting this proposal.</p>}
+                  {draftReviewActive && <p>Resolve the pending design draft before accepting this proposal.</p>}
                   <div><button className="button button-outline" type="button" onClick={() => decideMapProposal(false)} disabled={projectBusy}>Reject map update</button>
-                    <button className="button button-primary" type="button" onClick={() => decideMapProposal(true)} disabled={projectBusy || mapDirty}>Apply map update</button></div>
+                    <button className="button button-primary" type="button" onClick={() => decideMapProposal(true)} disabled={projectBusy || mapDirty || draftReviewActive}>Apply map update</button></div>
                 </div>}
                 {!reviewingMap && mapProposals.length === 0 && reviewFiles.length > 0 && <div className="map-review">
                   <span>Changed files: {reviewFiles.join(' · ')}</span>
                   {reviewError && <strong role="alert">{reviewError}</strong>}
                   <button className="button button-outline" type="button" onClick={reviewMapChanges} disabled={mapDirty}>Review map alignment</button>
-                  {mapDirty && <small>Save the map first.</small>}
+                  {mapDirty && <small>Save map edits as a draft first.</small>}
                 </div>}
                 <form className="composer" onSubmit={sendMessage}>
                   {!project
@@ -931,13 +1055,13 @@ function App() {
                     aria-label="Message the selected project component"
                     value={draft}
                     rows={1}
-                    placeholder={!project ? 'Choose a project folder to start chatting' : showChatStarter ? '만들고 싶은 것을 편하게 설명해 주세요' : draftReviewActive ? 'Ask the Agent to revise the saved draft…' : nodes.length > 0 ? developmentReady ? unansweredQuestions(activeNodeData as ComponentData).length > 0 ? 'Answer the open question in Details to unlock development…' : `Request development for ${activeNodeData?.title ?? 'the selected node'}…` : 'Approve the map before requesting development…' : `Message ${activeNodeData?.title ?? 'the project'}... (⌘ ↵ to send)`}
-                    disabled={!project || !agentVersion || agentRunning || reviewingMap || draftEditDirty || mapProposals.length > 0 || !!reviewError || (nodes.length > 0 && (!developmentReady || !selectedNode))}
+                    placeholder={!project ? 'Choose a project folder to start chatting' : showChatStarter ? '만들고 싶은 것을 편하게 설명해 주세요' : mapDirty ? 'Save map edits as a draft before chatting…' : draftReviewActive ? 'Ask the Agent to revise the saved draft…' : nodes.length > 0 ? developmentReady ? unansweredQuestions(activeNodeData as ComponentData).length > 0 ? 'Answer the open question in Details to unlock development…' : `Request development for ${activeNodeData?.title ?? 'the selected node'}…` : 'Approve the map before requesting development…' : `Message ${activeNodeData?.title ?? 'the project'}... (⌘ ↵ to send)`}
+                    disabled={!project || !agentVersion || agentRunning || initialDesignPending || reviewingMap || draftEditDirty || mapProposals.length > 0 || !!reviewError || (nodes.length > 0 && (!developmentReady || !selectedNode))}
                     onChange={(event) => setDraft(event.target.value)}
                     onKeyDown={handleComposerKeyDown}
                   />
-                  <button className="send-button" type="submit" disabled={!draft.trim() || !project || !agentVersion || agentRunning || reviewingMap || draftEditDirty || mapProposals.length > 0 || !!reviewError || (nodes.length > 0 && (!developmentReady || !selectedNode))} aria-label={draftReviewActive ? 'Request design draft revision' : nodes.length > 0 ? 'Request development for selected map node' : 'Send message'}>
-                    <Send size={17} />
+                  <button className="send-button" type="submit" disabled={!draft.trim() || !project || !agentVersion || agentRunning || initialDesignPending || reviewingMap || draftEditDirty || mapProposals.length > 0 || !!reviewError || (nodes.length > 0 && (!developmentReady || !selectedNode))} aria-label={agentRunning || initialDesignPending ? 'Generating design map' : draftReviewActive ? 'Request design draft revision' : nodes.length > 0 ? 'Request development for selected map node' : 'Send message'}>
+                    {agentRunning || initialDesignPending ? <LoaderCircle className="send-spinner" size={17} /> : <Send size={17} />}
                   </button>
                 </form>
               </div>
@@ -956,10 +1080,10 @@ function App() {
 
         {!isChatStart && project && <aside className={`details-panel${draftReviewActive ? ' draft-details-panel' : ''}`} aria-label="Selected component details">
           <div className="details-summary">
-            <div className="details-icon">{draftSelectedNode?.type === 'component' ? <AlertCircle size={23} /> : activeNodeData ? (() => { const Icon = iconByName[activeNodeData.icon]; return <Icon size={23} /> })() : <Workflow size={23} />}</div>
+            <div className="details-icon">{DraftNodeIcon ? <DraftNodeIcon size={23} /> : activeNodeData ? (() => { const Icon = iconByName[activeNodeData.icon]; return <Icon size={23} /> })() : <Workflow size={23} />}</div>
             <div className="details-title-copy">
-              <h2>{draftSelectedNode?.type === 'component' ? draftSelectedNode.data.title : activeNodeData?.title ?? 'Project Map'}</h2>
-              <span className="status-badge"><span />{draftSelectedNode ? 'Design question' : activeNodeData?.status ?? 'No selection'}</span>
+              <h2>{activeDraftNode?.type === 'component' ? activeDraftNode.data.title : activeNodeData?.title ?? 'Project Map'}</h2>
+              <span className="status-badge"><span />{draftReviewActive ? activeDraftNode ? draftSelectedPane === 'before' ? 'Confirmed map' : 'Unconfirmed draft' : 'Select a node' : activeNodeData?.status ?? 'No selection'}</span>
             </div>
             {!draftReviewActive && <button className="button button-outline" type="button" onClick={editNode} disabled={!project || !activeNodeData || projectBusy}>Edit</button>}
           </div>
@@ -980,11 +1104,26 @@ function App() {
           </div>}
 
           <div className="detail-scroll-area">
-            {draftReviewActive && draftSelectedNode?.type === 'component' && (
+            {draftReviewActive && draftSelectedPane === 'before' && beforeSelectedNode?.type === 'component' && (
+              <div className="detail-section draft-node-detail">
+                <p className="detail-eyebrow">BEFORE NODE · CONFIRMED MAP</p>
+                <h3>Responsibility and scope</h3>
+                <p className="detail-summary-text">{beforeSelectedNode.data.summary}</p>
+                <h3>Responsibilities</h3>
+                <ul className="responsibility-list">{beforeSelectedNode.data.responsibilities.map((item) => <li key={item}>{item}</li>)}</ul>
+                <dl className="detail-facts"><div><dt>Status</dt><dd>{beforeSelectedNode.data.status}</dd></div></dl>
+                {(beforeSelectedNode.data.questions ?? []).length > 0 && <div className="draft-question-panel"><h3><AlertCircle size={16} /> Open questions</h3>{beforeSelectedNode.data.questions?.map((question) => <p key={question}>{question}</p>)}</div>}
+                <p className="draft-detail-hint">This is the confirmed node before the proposed changes. Select a node in After to edit its draft.</p>
+              </div>
+            )}
+            {draftReviewActive && draftSelectedPane === 'after' && draftSelectedNode?.type === 'component' && (
               <div className="detail-section draft-node-detail">
                 <p className="detail-eyebrow">AFTER NODE</p>
                 <label>Node name<input value={draftSelectedNode.data.title} maxLength={120} disabled={projectBusy || agentRunning} onChange={(event) => updateDraftNode(draftSelectedNode.id, (node) => node.type === 'component' ? { ...node, data: { ...node.data, title: event.target.value } } : node)} /></label>
-                <label>Description<textarea value={draftSelectedNode.data.summary} rows={6} maxLength={4000} disabled={projectBusy || agentRunning} onChange={(event) => updateDraftNode(draftSelectedNode.id, (node) => node.type === 'component' ? { ...node, data: { ...node.data, summary: event.target.value } } : node)} /></label>
+                <label>Responsibility and scope<textarea value={draftSelectedNode.data.summary} rows={6} maxLength={4000} disabled={projectBusy || agentRunning} onChange={(event) => updateDraftNode(draftSelectedNode.id, (node) => node.type === 'component' ? { ...node, data: { ...node.data, summary: event.target.value } } : node)} /></label>
+                <label>Responsibilities (one per line)<textarea value={draftSelectedNode.data.responsibilities.join('\n')} rows={4} maxLength={4000} disabled={projectBusy || agentRunning} onChange={(event) => updateDraftNode(draftSelectedNode.id, (node) => node.type === 'component' ? { ...node, data: { ...node.data, responsibilities: event.target.value.split('\n').map((item) => item.trim()).filter(Boolean) } } : node)} /></label>
+                <h3>Responsibilities</h3>
+                <ul className="responsibility-list">{draftSelectedNode.data.responsibilities.map((item) => <li key={item}>{item}</li>)}</ul>
                 <div className="draft-question-panel"><h3><AlertCircle size={16} /> Open questions for this node</h3>{(draftSelectedNode.data.questions ?? []).length > 0 ? draftSelectedNode.data.questions?.map((question) => <p key={question}>{question}</p>) : <p className="muted-copy">No unresolved decisions for this node.</p>}</div>
                 <p className="draft-detail-hint">Edit the selected node here. The graph stays focused on structure; questions stay in the details panel.</p>
               </div>
@@ -993,12 +1132,13 @@ function App() {
               <div className="detail-section">
                 {editingNodeId === selectedNodeId && (
                   <form className="node-editor" onSubmit={updateNode}>
-                    <label>Title<input value={nodeTitle} onChange={(event) => setNodeTitle(event.target.value)} maxLength={120} required /></label>
-                    <label>Summary<textarea value={nodeSummary} onChange={(event) => setNodeSummary(event.target.value)} rows={4} /></label>
-                    <div><button className="button button-primary" type="submit">Apply changes</button><button className="button button-outline" type="button" onClick={() => setEditingNodeId(null)}>Cancel</button></div>
+                    <label>Title<input value={nodeTitle} onChange={(event) => setNodeTitle(event.target.value)} maxLength={120} required disabled={projectBusy} /></label>
+                    <label>Responsibility and scope<textarea value={nodeSummary} onChange={(event) => setNodeSummary(event.target.value)} rows={4} disabled={projectBusy} /></label>
+                    <label>Responsibilities (one per line)<textarea value={nodeResponsibilities} onChange={(event) => setNodeResponsibilities(event.target.value)} rows={4} required disabled={projectBusy} /></label>
+                    <div><button className="button button-primary" type="submit" disabled={projectBusy}>Apply changes</button><button className="button button-outline" type="button" onClick={() => setEditingNodeId(null)} disabled={projectBusy}>Cancel</button></div>
                   </form>
                 )}
-                <h3>Summary</h3>
+                <h3>Responsibility and scope</h3>
                 <p className="detail-summary-text">{activeNodeData.summary}</p>
                 {(activeNodeData.questions ?? []).length > 0 && <div className="draft-question-panel detail-question-panel"><h3><AlertCircle size={16} /> Open questions</h3>{activeNodeData.questions?.map((question) => <label className="question-answer" key={question}><span>{question}</span><textarea rows={3} placeholder="Answer this question to unlock development…" value={activeNodeData.answers?.[question] ?? ''} disabled={projectBusy} onChange={(event) => updateNodeQuestionAnswer(selectedNodeId, question, event.target.value)} /> </label>)}<small>{unansweredQuestions(activeNodeData).length > 0 ? 'Answer all questions, then save the map before development.' : 'All questions answered. Save the map to confirm these decisions.'}</small></div>}
                 <h3 className="section-heading-spaced">Key responsibilities</h3>
@@ -1013,7 +1153,7 @@ function App() {
                   <div><dt>Files</dt><dd>{activeNodeData.files.length ? `${activeNodeData.files.length} linked` : 'None linked'}</dd></div>
                 </dl>
                 <div className="relationships-heading"><h3>Relationships</h3><button type="button" className="text-action" onClick={() => setActiveDetailTab('relationships')}>View all</button></div>
-                <RelationshipList relatedNodes={relatedNodes} onSelect={(id) => { setSelectedNodeId(id); setActiveDetailTab('overview') }} />
+                <RelationshipList relationships={relatedRelationships} onSelect={(id) => { setSelectedNodeId(id); setActiveDetailTab('overview') }} />
               </div>
             )}
 
@@ -1028,19 +1168,30 @@ function App() {
 
             {!draftReviewActive && activeDetailTab === 'tasks' && (
               <div className="detail-section">
-                <h3>Development tasks</h3>
-                {(activeNodeData?.responsibilities ?? []).map((task) => (
-                  <div className="detail-task" key={task}><span className="task-checkbox" /><div><strong>{task}</strong><small>Not started</small></div></div>
-                ))}
-                {!activeNodeData && <div className="detail-empty"><ListChecks size={20} /><strong>Select a component</strong><p>Task details are linked to individual map nodes.</p></div>}
+                <h3>Development units are separate from node responsibilities</h3>
+                {developmentUnits.length === 0
+                  ? <div className="detail-empty"><ListChecks size={20} /><strong>No confirmed units yet</strong><p>Define a target, goal, and observable completion criteria to start a unit.</p></div>
+                  : developmentUnits.map((unit) => {
+                    const unitNode = nodes.find((node) => node.id === unit.nodeId && node.type === 'component')
+                    const statusLabel = unit.status === 'started' ? 'Started' : unit.status === 'start_failed' ? 'Could not start' : 'Confirmed'
+                    return <article className="detail-task development-unit-card" key={unit.id}>
+                      <ListChecks size={17} />
+                      <div>
+                        <strong>{unit.goal}</strong>
+                        <small>{unitNode?.type === 'component' ? unitNode.data.title : unit.nodeId} · map revision {unit.mapRevision} · {statusLabel}</small>
+                        <ul>{unit.completionCriteria.map((criterion) => <li key={criterion}>{criterion}</li>)}</ul>
+                        {unit.statusDetail && <small role="alert">{unit.statusDetail}</small>}
+                      </div>
+                    </article>
+                  })}
               </div>
             )}
 
             {!draftReviewActive && activeDetailTab === 'relationships' && (
               <div className="detail-section">
                 <h3>Connected components</h3>
-                <RelationshipList relatedNodes={relatedNodes} onSelect={(id) => { setSelectedNodeId(id); setActiveDetailTab('overview') }} />
-                {relatedNodes.length === 0 && <div className="detail-empty"><GitBranch size={20} /><strong>No relationships</strong><p>Connect this component to another node on the map.</p></div>}
+                <RelationshipList relationships={relatedRelationships} onSelect={(id) => { setSelectedNodeId(id); setActiveDetailTab('overview') }} />
+                {relatedRelationships.length === 0 && <div className="detail-empty"><GitBranch size={20} /><strong>No relationships</strong><p>Choose a relationship type before connecting nodes on the map.</p></div>}
               </div>
             )}
           </div>
@@ -1049,6 +1200,39 @@ function App() {
         </aside>}
         </>}
       </div>
+
+      {developmentUnitOpen && <div className="development-unit-backdrop">
+        <section className="development-unit-dialog" role="dialog" aria-modal="true" aria-labelledby="development-unit-title">
+          <header className="development-unit-heading">
+            <div><p className="detail-eyebrow">CONFIRMED MAP · REVISION {mapRevision}</p><h2 id="development-unit-title">Define one development unit</h2></div>
+            <button className="button button-outline" type="button" onClick={() => setDevelopmentUnitOpen(false)} disabled={agentRunning} aria-label="Close development-unit dialog"><X size={17} /></button>
+          </header>
+          <form className="development-unit-form" onSubmit={(event) => { event.preventDefault(); void startDevelopment() }}>
+            <label>Architecture responsibility
+              <select value={developmentUnitNodeId} onChange={(event) => setDevelopmentUnitNodeId(event.target.value)} disabled={agentRunning}>
+                <option value="">Choose a node</option>
+                {nodes.filter((node): node is ComponentFlowNode => node.type === 'component').map((node) => <option key={node.id} value={node.id}>{node.data.title}</option>)}
+              </select>
+            </label>
+            {developmentNode && <div className="development-unit-node-summary">
+              <strong>{developmentNode.data.title}</strong><p>{developmentNode.data.summary}</p>
+              <ul>{developmentNode.data.responsibilities.map((responsibility) => <li key={responsibility}>{responsibility}</li>)}</ul>
+              {unansweredQuestions(developmentNode.data).length > 0 && <p className="development-unit-warning" role="alert">Answer this node’s open questions before starting its unit.</p>}
+            </div>}
+            <label>Unit goal
+              <textarea value={developmentUnitGoal} onChange={(event) => setDevelopmentUnitGoal(event.target.value)} rows={3} maxLength={4000} placeholder="Describe the specific outcome for this unit." disabled={agentRunning} />
+            </label>
+            <label>Completion criteria (one observable condition per line)
+              <textarea value={developmentUnitCriteria} onChange={(event) => setDevelopmentUnitCriteria(event.target.value)} rows={5} maxLength={20000} placeholder={'A user can…\nThe result remains correct after…'} disabled={agentRunning} />
+            </label>
+            <p className="development-unit-hint">Only this confirmed goal and its criteria will define the work. The unit is pinned to map revision {mapRevision}.</p>
+            <footer>
+              <button className="button button-outline" type="button" onClick={() => setDevelopmentUnitOpen(false)} disabled={agentRunning}>Cancel</button>
+              <button className="button button-primary" type="submit" disabled={!agentVersion || agentRunning || !developmentNode || !developmentUnitGoal.trim() || completionCriteria.length === 0 || completionCriteria.length > 20 || completionCriteria.some((criterion) => criterion.length > 1000) || unansweredQuestions(developmentNode.data).length > 0}>Confirm unit and start</button>
+            </footer>
+          </form>
+        </section>
+      </div>}
 
       {project && !isChatStart && projectSidebarCollapsed && <div className="sidebar-reopen-hotspot">
         <button className="sidebar-reopen-button" type="button" onClick={() => setProjectSidebarCollapsed(false)} aria-label="Expand project sidebar" title="Expand project sidebar">
@@ -1061,20 +1245,25 @@ function App() {
   )
 }
 
-function RelationshipList({ relatedNodes, onSelect }: { relatedNodes: ComponentFlowNode[]; onSelect: (id: string) => void }) {
-  if (relatedNodes.length === 0) {
+function RelationshipList({ relationships, onSelect }: { relationships: { node: ComponentFlowNode; edge: HeimEdge; selectedIsSource: boolean }[]; onSelect: (id: string) => void }) {
+  if (relationships.length === 0) {
     return <p className="muted-copy">No connected components yet.</p>
   }
 
   return (
     <div className="relationship-list">
-      {relatedNodes.map((node) => {
+      {relationships.map(({ node, edge, selectedIsSource }) => {
         const Icon = iconByName[node.data.icon]
+        const relation = edge.data?.relation === 'depends_on'
+          ? selectedIsSource ? 'Depends on →' : '← Required by'
+          : edge.data?.relation === 'interacts_with'
+            ? selectedIsSource ? 'Interacts with →' : '← Interacts with'
+            : 'Unclassified'
         return (
-          <button type="button" className="relationship-row" key={node.id} onClick={() => onSelect(node.id)}>
+          <button type="button" className="relationship-row" key={edge.id} onClick={() => onSelect(node.id)}>
             <span className="relationship-icon"><Icon size={15} /></span>
             <span className="relationship-name">{node.data.title}</span>
-            <span className="relationship-type">Related</span>
+            <span className="relationship-type">{relation}</span>
           </button>
         )
       })}

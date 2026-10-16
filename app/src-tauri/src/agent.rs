@@ -19,7 +19,7 @@ use tokio::{
     time::{Duration, timeout},
 };
 
-use crate::{database, ensure_project, has_current_approved_map};
+use crate::{database, ensure_project, record_development_unit, update_development_unit_status};
 
 #[derive(Default)]
 pub struct AgentManager {
@@ -667,62 +667,20 @@ pub async fn send_development_message(
     app: AppHandle,
     manager: State<'_, AgentManager>,
     project_id: i64,
+    map_revision: i64,
     node_id: String,
-    text: String,
-) -> Result<(), String> {
-    let text = text.trim();
-    if text.is_empty() || text.len() > 20_000 || node_id.trim().is_empty() || node_id.len() > 128 {
-        return Err("Invalid development request".into());
-    }
-    let conn = database(&app)?;
+    goal: String,
+    completion_criteria: Vec<String>,
+) -> Result<i64, String> {
+    let mut conn = database(&app)?;
     ensure_project(&conn, project_id)?;
-    let (root, nodes_json, edges_json, revision): (String, String, String, i64) = conn
+    let root: String = conn
         .query_row(
-            "SELECT p.root, m.nodes, m.edges, m.revision
-             FROM projects p JOIN project_maps m ON m.project_id = p.id WHERE p.id = ?1",
+            "SELECT root FROM projects WHERE id = ?1",
             [project_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
-    if !has_current_approved_map(&conn, project_id)? {
-        return Err("Approve a design draft before starting development".into());
-    }
-    let nodes: Vec<Value> = serde_json::from_str(&nodes_json).map_err(|error| error.to_string())?;
-    let edges: Vec<Value> = serde_json::from_str(&edges_json).map_err(|error| error.to_string())?;
-    let selected = nodes
-        .iter()
-        .find(|node| {
-            node.get("id").and_then(Value::as_str) == Some(node_id.as_str())
-                && node.get("type").and_then(Value::as_str) == Some("component")
-        })
-        .ok_or("Select a component from the approved map")?;
-    let mut related_ids = HashSet::new();
-    for edge in &edges {
-        let source = edge.get("source").and_then(Value::as_str);
-        let target = edge.get("target").and_then(Value::as_str);
-        if source == Some(node_id.as_str()) {
-            if let Some(target) = target {
-                related_ids.insert(target.to_owned());
-            }
-        } else if target == Some(node_id.as_str()) {
-            if let Some(source) = source {
-                related_ids.insert(source.to_owned());
-            }
-        }
-    }
-    let related = nodes
-        .iter()
-        .filter(|node| {
-            node.get("id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| related_ids.contains(id))
-        })
-        .collect::<Vec<_>>();
-    let prompt = format!(
-        "The user approved Heim map revision {revision} and explicitly requested development for exactly this selected unit. Implement the selected product capability itself, not merely tests, fixtures, documentation, or a test harness. Do not create a tests-only result. Tests are allowed only as supporting verification after the product behavior is implemented. Do not implement other map nodes. Respect the existing Codex workspace-write sandbox and approval policy.\n\nSelected component:\n{}\n\nDirectly related context (context only, not scope expansion):\n{}\n\nUser development request:\n{text}",
-        serde_json::to_string_pretty(selected).map_err(|error| error.to_string())?,
-        serde_json::to_string_pretty(&related).map_err(|error| error.to_string())?,
-    );
     let mut guard = manager.session.lock().await;
     if guard
         .as_ref()
@@ -730,10 +688,47 @@ pub async fn send_development_message(
     {
         return Err("Finish or cancel the current agent turn before starting development".into());
     }
+    let unit = record_development_unit(
+        &mut conn,
+        project_id,
+        map_revision,
+        &node_id,
+        &goal,
+        &completion_criteria,
+    )?;
+    let criteria = unit
+        .completion_criteria
+        .iter()
+        .map(|criterion| format!("- {criterion}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prompt = format!(
+        "The user explicitly confirmed development unit #{id} against approved Heim map revision {revision}. Implement only the unit goal and its completion criteria, within the selected architecture responsibility. Do not interpret the full node responsibility as additional scope, choose another unit, or continue after this unit. Implement product behavior, not merely tests, fixtures, documentation, or a test harness. Tests may support verification after implementation. Before reporting, assess every completion criterion and state which are met or unmet. Respect the existing Codex workspace-write sandbox and approval policy.\n\nSelected architecture responsibility:\n{selected}\n\nDirectly related context (context only, not scope expansion):\n{related}\n\nConfirmed unit goal:\n{goal}\n\nCompletion criteria:\n{criteria}",
+        id = unit.id,
+        revision = unit.map_revision,
+        selected =
+            serde_json::to_string_pretty(&unit.selected_node).map_err(|error| error.to_string())?,
+        related =
+            serde_json::to_string_pretty(&unit.related_nodes).map_err(|error| error.to_string())?,
+        goal = unit.goal,
+    );
     *guard = None;
-    *guard = Some(start_session(&app, project_id, &root, AgentMode::Development).await?);
+    let session = match start_session(&app, project_id, &root, AgentMode::Development).await {
+        Ok(session) => session,
+        Err(error) => {
+            update_development_unit_status(&conn, unit.id, "start_failed", Some(&error))?;
+            return Err(error);
+        }
+    };
+    *guard = Some(session);
     let session = guard.as_ref().ok_or("Agent session unavailable")?;
     if session.busy.swap(true, Ordering::AcqRel) {
+        update_development_unit_status(
+            &conn,
+            unit.id,
+            "start_failed",
+            Some("Agent is already working"),
+        )?;
         return Err("Agent is already working".into());
     }
     let before = match tokio::task::spawn_blocking({
@@ -745,18 +740,30 @@ pub async fn send_development_message(
         Ok(snapshot) => snapshot,
         Err(error) => {
             session.busy.store(false, Ordering::Release);
+            update_development_unit_status(
+                &conn,
+                unit.id,
+                "start_failed",
+                Some(&error.to_string()),
+            )?;
             return Err(error.to_string());
         }
     };
     *session.snapshot.lock().await = Some(before);
+    if let Err(error) = update_development_unit_status(&conn, unit.id, "started", None) {
+        session.busy.store(false, Ordering::Release);
+        return Err(error);
+    }
     let result = session.request(
         "turn/start",
         json!({"threadId":session.thread_id, "input":[{"type":"text", "text":prompt}], "cwd":root}),
     ).await;
-    if result.is_err() {
+    if let Err(error) = result {
         session.busy.store(false, Ordering::Release);
+        update_development_unit_status(&conn, unit.id, "start_failed", Some(&error))?;
+        return Err(error);
     }
-    result.map(|_| ())
+    Ok(unit.id)
 }
 
 pub(crate) async fn request_design_draft(
@@ -781,10 +788,10 @@ pub(crate) async fn request_design_draft(
         .map_err(|error| error.to_string())?;
     let prompt = match latest_draft {
         Some(draft) => format!(
-            "Revise the latest saved design draft only. Do not implement or create/edit files. Treat the saved draft below as the current user-edited source of truth; preserve stable IDs for unchanged nodes and apply the user's requested changes. Return exactly one JSON object without markdown using this schema: {{\"goal\":string,\"nodes\":[{{\"id\":string,\"title\":string,\"summary\":string,\"type\":\"component\",\"status\":\"not_started\",\"questions\":[string]}}],\"edges\":[{{\"id\":string,\"source\":string,\"target\":string,\"label\":string}}],\"questions\":[string],\"assumptions\":[string]}}. Put unresolved decisions next to the relevant node in its questions array; use the top-level questions array only for project-wide questions. Use unique stable IDs, valid edge endpoints, and status not_started for every node.\n\nUser change request:\n{text}\n\nLatest saved user-edited design draft:\n{draft}"
+            "Revise the latest saved design draft only. Do not implement or create/edit files. Treat the saved draft below as the current user-edited source of truth; preserve stable IDs for unchanged nodes and apply the user's requested changes. Return exactly one JSON object without markdown using this schema: {{\"goal\":string,\"nodes\":[{{\"id\":string,\"title\":string,\"summary\":string explaining the node's responsibility and boundaries,\"responsibilities\":[string],\"type\":\"component\",\"status\":\"not_started\",\"questions\":[string]}}],\"edges\":[{{\"id\":string,\"source\":string,\"target\":string,\"relation\":\"depends_on\"|\"interacts_with\"}}],\"questions\":[string],\"assumptions\":[string]}}. For depends_on, source requires target; for interacts_with, source interacts with target. Never use an untyped or generic related edge. Put unresolved decisions next to the relevant node in its questions array; use the top-level questions array only for project-wide questions. Use unique stable IDs, valid edge endpoints, at least one responsibility per node, and status not_started for every node.\n\nUser change request:\n{text}\n\nLatest saved user-edited design draft:\n{draft}"
         ),
         None => format!(
-            "Design a project map only. Do not implement or create/edit files. Return exactly one JSON object without markdown using this schema: {{\"goal\":string,\"nodes\":[{{\"id\":string,\"title\":string,\"summary\":string,\"type\":\"component\",\"status\":\"not_started\",\"questions\":[string]}}],\"edges\":[{{\"id\":string,\"source\":string,\"target\":string,\"label\":string}}],\"questions\":[string],\"assumptions\":[string]}}. Put unresolved decisions next to the relevant node in its questions array; use the top-level questions array only for project-wide questions. Use unique stable IDs, valid edge endpoints, and status not_started for every node.\n\nProduct description:\n{text}"
+            "Design a logical architecture map only. Do not implement or create/edit files. Nodes are persistent system responsibilities, not files or one-off tasks. Return exactly one JSON object without markdown using this schema: {{\"goal\":string,\"nodes\":[{{\"id\":string,\"title\":string,\"summary\":string explaining the node's responsibility and boundaries,\"responsibilities\":[string],\"type\":\"component\",\"status\":\"not_started\",\"questions\":[string]}}],\"edges\":[{{\"id\":string,\"source\":string,\"target\":string,\"relation\":\"depends_on\"|\"interacts_with\"}}],\"questions\":[string],\"assumptions\":[string]}}. For depends_on, source requires target; for interacts_with, source interacts with target. Never use an untyped or generic related edge. Put unresolved decisions next to the relevant node in its questions array; use the top-level questions array only for project-wide questions. Use unique stable IDs, valid edge endpoints, at least one responsibility per node, and status not_started for every node.\n\nProduct description:\n{text}"
         ),
     };
     let (busy, response) = {

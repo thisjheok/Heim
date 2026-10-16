@@ -77,6 +77,19 @@ const SCHEMA: &str = "
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(project_id, version)
     );
+    CREATE TABLE IF NOT EXISTS development_units (
+        id INTEGER PRIMARY KEY,
+        project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        map_revision INTEGER NOT NULL,
+        node_id TEXT NOT NULL,
+        goal TEXT NOT NULL,
+        completion_criteria TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'confirmed'
+            CHECK(status IN ('confirmed', 'started', 'start_failed')),
+        status_detail TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        started_at TEXT
+    );
 ";
 
 fn database(app: &tauri::AppHandle) -> Result<Connection, String> {
@@ -250,6 +263,7 @@ fn validate_map(nodes: &[Value], edges: &[Value]) -> Result<(), String> {
         return Err("Map is too large".into());
     }
     let mut ids = HashSet::new();
+    let mut component_ids = HashSet::new();
     for node in nodes {
         let id = node
             .get("id")
@@ -270,6 +284,40 @@ fn validate_map(nodes: &[Value], edges: &[Value]) -> Result<(), String> {
         {
             return Err("Invalid node".into());
         }
+        if node.get("type").and_then(Value::as_str) == Some("component") {
+            let data = node.get("data").ok_or("Invalid component data")?;
+            if !data
+                .get("title")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty() && value.len() <= 120)
+                || !data
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty() && value.len() <= 4_000)
+                || !data
+                    .get("responsibilities")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| {
+                        !items.is_empty()
+                            && items.len() <= 100
+                            && items.iter().all(|item| {
+                                item.as_str().is_some_and(|value| {
+                                    !value.trim().is_empty() && value.len() <= 1_000
+                                })
+                            })
+                    })
+                || !data
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty() && value.len() <= 80)
+            {
+                return Err(
+                    "Component must define its responsibility, scope, responsibilities, and status"
+                        .into(),
+                );
+            }
+            component_ids.insert(id);
+        }
     }
     let mut edge_ids = HashSet::new();
     for edge in edges {
@@ -289,8 +337,15 @@ fn validate_map(nodes: &[Value], edges: &[Value]) -> Result<(), String> {
             .get("target")
             .and_then(Value::as_str)
             .ok_or("Invalid edge target")?;
-        if source == target || !ids.contains(source) || !ids.contains(target) {
-            return Err("Edge references an invalid node".into());
+        if source == target || !component_ids.contains(source) || !component_ids.contains(target) {
+            return Err("Edge must connect two distinct architecture nodes".into());
+        }
+        let relation = edge
+            .pointer("/data/relation")
+            .and_then(Value::as_str)
+            .ok_or("Edge relationship type is missing")?;
+        if !matches!(relation, "depends_on" | "interacts_with") {
+            return Err("Edge relationship type must be depends_on or interacts_with".into());
         }
     }
     Ok(())
@@ -314,16 +369,6 @@ fn save_map(conn: &Connection, project_id: i64, map: &ProjectMap) -> Result<i64,
     Ok(map.revision + 1)
 }
 
-#[tauri::command]
-fn save_project_map(
-    app: tauri::AppHandle,
-    project_id: i64,
-    map: ProjectMap,
-) -> Result<i64, String> {
-    let conn = database(&app)?;
-    save_map(&conn, project_id, &map)
-}
-
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DesignDraft {
@@ -344,6 +389,13 @@ struct StoredDesignDraft {
     draft: DesignDraft,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MapEditDraftResult {
+    draft: StoredDesignDraft,
+    confirmed_map: ProjectMap,
+}
+
 fn validate_design_draft(draft: &DesignDraft) -> Result<(), String> {
     if draft.goal.trim().is_empty() || draft.goal.len() > 4_000 {
         return Err("Draft goal must contain 1-4000 characters".into());
@@ -356,18 +408,22 @@ fn validate_design_draft(draft: &DesignDraft) -> Result<(), String> {
         return Err("Draft node, question, or assumption count is invalid".into());
     }
     for node in &draft.nodes {
-        if node.get("type").and_then(Value::as_str) != Some("component")
-            || node.pointer("/data/status").and_then(Value::as_str) != Some("Not started")
-            || !node
-                .pointer("/data/title")
-                .and_then(Value::as_str)
-                .is_some_and(|value| !value.trim().is_empty() && value.len() <= 120)
-            || !node
-                .pointer("/data/summary")
-                .and_then(Value::as_str)
-                .is_some_and(|value| value.len() <= 4_000)
-        {
-            return Err("Design draft nodes must be components with Not started status".into());
+        match node.get("type").and_then(Value::as_str) {
+            Some("component") => {
+                if !node
+                    .pointer("/data/title")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty() && value.len() <= 120)
+                    || !node
+                        .pointer("/data/summary")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.trim().is_empty() && value.len() <= 4_000)
+                {
+                    return Err("Design draft components must define a title and scope".into());
+                }
+            }
+            Some("layer") => {}
+            _ => return Err("Design draft contains an unsupported node type".into()),
         }
     }
     if draft
@@ -378,14 +434,120 @@ fn validate_design_draft(draft: &DesignDraft) -> Result<(), String> {
     {
         return Err("Draft questions and assumptions must contain 1-4000 characters".into());
     }
-    if draft.edges.iter().any(|edge| {
-        edge.get("label")
-            .and_then(Value::as_str)
-            .is_some_and(|label| label.len() > 120)
-    }) {
-        return Err("Draft relationship labels are too long".into());
-    }
     validate_map(&draft.nodes, &draft.edges)
+}
+
+fn persist_map_edit_draft(
+    conn: &mut Connection,
+    project_id: i64,
+    map: ProjectMap,
+) -> Result<MapEditDraftResult, String> {
+    ensure_project(conn, project_id)?;
+    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    let (confirmed_nodes, confirmed_edges, current_revision): (String, String, i64) = tx
+        .query_row(
+            "SELECT nodes, edges, revision FROM project_maps WHERE project_id = ?1",
+            [project_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    if map.revision != current_revision {
+        return Err("Map changed since it was opened; reload before creating a draft".into());
+    }
+    let has_pending: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM design_drafts WHERE project_id = ?1 AND state = 'pending')",
+            [project_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if has_pending {
+        return Err("A design draft is already pending review".into());
+    }
+    let version: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM design_drafts WHERE project_id = ?1",
+            [project_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let draft = DesignDraft {
+        goal: "Edit the confirmed architecture map".into(),
+        nodes: map.nodes,
+        edges: map.edges,
+        questions: Vec::new(),
+        assumptions: Vec::new(),
+    };
+    validate_design_draft(&draft)?;
+    let serialized = serde_json::to_string(&draft).map_err(|error| error.to_string())?;
+    let inserted = tx
+        .execute(
+            "INSERT INTO design_drafts (project_id, base_revision, version, draft)
+             SELECT ?1, ?2, ?3, ?4 FROM project_maps
+             WHERE project_id = ?1 AND revision = ?2
+               AND NOT EXISTS (SELECT 1 FROM design_drafts WHERE project_id = ?1 AND state = 'pending')",
+            rusqlite::params![project_id, current_revision, version, serialized],
+        )
+        .map_err(|error| error.to_string())?;
+    if inserted != 1 {
+        return Err("Map or pending draft changed while saving the proposal".into());
+    }
+    let id = tx.last_insert_rowid();
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(MapEditDraftResult {
+        draft: StoredDesignDraft {
+            id,
+            project_id,
+            base_revision: current_revision,
+            version,
+            draft,
+        },
+        confirmed_map: ProjectMap {
+            nodes: serde_json::from_str(&confirmed_nodes).map_err(|error| error.to_string())?,
+            edges: serde_json::from_str(&confirmed_edges).map_err(|error| error.to_string())?,
+            revision: current_revision,
+        },
+    })
+}
+
+#[tauri::command]
+fn create_map_edit_draft(
+    app: tauri::AppHandle,
+    project_id: i64,
+    map: ProjectMap,
+) -> Result<MapEditDraftResult, String> {
+    let mut conn = database(&app)?;
+    persist_map_edit_draft(&mut conn, project_id, map)
+}
+
+fn edge_handles(source: &Value, target: &Value) -> (&'static str, &'static str) {
+    let dx = target
+        .pointer("/position/x")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
+        - source
+            .pointer("/position/x")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+    let dy = target
+        .pointer("/position/y")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
+        - source
+            .pointer("/position/y")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+    if dx.abs() >= dy.abs() {
+        if dx >= 0.0 {
+            ("source-right", "target-left")
+        } else {
+            ("source-left", "target-right")
+        }
+    } else if dy >= 0.0 {
+        ("source-bottom", "target-top")
+    } else {
+        ("source-top", "target-bottom")
+    }
 }
 
 fn parse_design_response(response: &str) -> Result<DesignDraft, String> {
@@ -418,8 +580,20 @@ fn parse_design_response(response: &str) -> Result<DesignDraft, String> {
         let summary = raw
             .get("summary")
             .and_then(Value::as_str)
-            .filter(|summary| summary.len() <= 4_000)
+            .filter(|summary| !summary.trim().is_empty() && summary.len() <= 4_000)
             .ok_or("Draft node summary is invalid")?;
+        let responsibilities = raw
+            .get("responsibilities")
+            .and_then(Value::as_array)
+            .ok_or("Draft node responsibilities are missing")?
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .filter(|value| !value.trim().is_empty() && value.len() <= 1_000)
+                    .map(str::to_owned)
+                    .ok_or("Draft node responsibility is invalid")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let questions = raw
             .get("questions")
             .and_then(Value::as_array)
@@ -431,8 +605,8 @@ fn parse_design_response(response: &str) -> Result<DesignDraft, String> {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let position = json!({"x": (index % 4) as i32 * 260, "y": (index / 4) as i32 * 180});
-        nodes.push(json!({"id":id,"type":"component","position":position,"data":{"title":title,"summary":summary,"kind":"Planned component","technology":"To be decided","status":"Not started","icon":"map","responsibilities":[],"files":[],"questions":questions}}));
+        let position = json!({"x": (index % 3) as i32 * 380, "y": (index / 3) as i32 * 250});
+        nodes.push(json!({"id":id,"type":"component","position":position,"data":{"title":title,"summary":summary,"kind":"System responsibility","technology":"To be decided","status":"Not started","icon":"map","responsibilities":responsibilities,"files":[],"questions":questions}}));
     }
     let edges = value
         .get("edges")
@@ -443,11 +617,25 @@ fn parse_design_response(response: &str) -> Result<DesignDraft, String> {
             let id = edge.get("id").and_then(Value::as_str).ok_or("Draft edge ID is missing")?;
             let source = edge.get("source").and_then(Value::as_str).ok_or("Draft edge source is missing")?;
             let target = edge.get("target").and_then(Value::as_str).ok_or("Draft edge target is missing")?;
-            let label = edge.get("label").and_then(Value::as_str).unwrap_or("related");
-            if id.len() > 128 || label.len() > 120 {
+            let relation = edge
+                .get("relation")
+                .and_then(Value::as_str)
+                .filter(|relation| matches!(*relation, "depends_on" | "interacts_with"))
+                .ok_or("Draft edge relationship type is invalid")?;
+            if id.is_empty() || id.len() > 128 {
                 return Err("Draft edge data is too long".into());
             }
-            Ok(json!({"id":id,"source":source,"target":target,"label":label,"type":"smoothstep","animated":false}))
+            let source_node = nodes
+                .iter()
+                .find(|node| node.get("id").and_then(Value::as_str) == Some(source))
+                .ok_or("Draft edge source references a missing node")?;
+            let target_node = nodes
+                .iter()
+                .find(|node| node.get("id").and_then(Value::as_str) == Some(target))
+                .ok_or("Draft edge target references a missing node")?;
+            let (source_handle, target_handle) = edge_handles(source_node, target_node);
+            let label = if relation == "depends_on" { "Depends on" } else { "Interacts with" };
+            Ok(json!({"id":id,"source":source,"target":target,"sourceHandle":source_handle,"targetHandle":target_handle,"data":{"relation":relation},"label":label,"type":"smoothstep","animated":false,"markerEnd":{"type":"arrowclosed","color":"#aeb8c9"}}))
         })
         .collect::<Result<Vec<_>, String>>()?;
     let strings = |key: &str| -> Result<Vec<String>, String> {
@@ -579,6 +767,230 @@ pub(crate) fn has_current_approved_map(conn: &Connection, project_id: i64) -> Re
     .map_err(|error| error.to_string())
 }
 
+pub(crate) struct DevelopmentUnit {
+    pub id: i64,
+    pub map_revision: i64,
+    pub node_id: String,
+    pub goal: String,
+    pub completion_criteria: Vec<String>,
+    pub selected_node: Value,
+    pub related_nodes: Vec<Value>,
+}
+
+fn node_has_unanswered_questions(node: &Value) -> bool {
+    let Some(questions) = node.pointer("/data/questions").and_then(Value::as_array) else {
+        return false;
+    };
+    questions.iter().any(|question| {
+        let Some(question) = question.as_str() else {
+            return true;
+        };
+        !node
+            .pointer("/data/answers")
+            .and_then(Value::as_object)
+            .and_then(|answers| answers.get(question))
+            .and_then(Value::as_str)
+            .is_some_and(|answer| !answer.trim().is_empty())
+    })
+}
+
+pub(crate) fn record_development_unit(
+    conn: &mut Connection,
+    project_id: i64,
+    expected_revision: i64,
+    node_id: &str,
+    goal: &str,
+    completion_criteria: &[String],
+) -> Result<DevelopmentUnit, String> {
+    let goal = goal.trim();
+    if goal.is_empty() || goal.len() > 4_000 {
+        return Err("Development-unit goal must contain 1-4000 characters".into());
+    }
+    if completion_criteria.is_empty()
+        || completion_criteria.len() > 20
+        || completion_criteria
+            .iter()
+            .any(|criterion| criterion.trim().is_empty() || criterion.len() > 1_000)
+    {
+        return Err("Provide 1-20 completion criteria, each containing 1-1000 characters".into());
+    }
+    if node_id.trim().is_empty() || node_id.len() > 128 {
+        return Err("Invalid development-unit node".into());
+    }
+    ensure_project(conn, project_id)?;
+    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    let (nodes_json, edges_json, map_revision): (String, String, i64) = tx
+        .query_row(
+            "SELECT nodes, edges, revision FROM project_maps WHERE project_id = ?1",
+            [project_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    if map_revision != expected_revision {
+        return Err("Approved map changed; review it and define the unit again".into());
+    }
+    if !has_current_approved_map(&tx, project_id)? {
+        return Err("Approve a design map before confirming a development unit".into());
+    }
+    let nodes: Vec<Value> = serde_json::from_str(&nodes_json).map_err(|error| error.to_string())?;
+    let edges: Vec<Value> = serde_json::from_str(&edges_json).map_err(|error| error.to_string())?;
+    let selected_node = nodes
+        .iter()
+        .find(|node| {
+            node.get("id").and_then(Value::as_str) == Some(node_id)
+                && node.get("type").and_then(Value::as_str) == Some("component")
+        })
+        .ok_or("Select a system-responsibility node from the approved map")?;
+    if node_has_unanswered_questions(selected_node) {
+        return Err("Answer all questions on this node before starting development".into());
+    }
+    let mut related_ids = HashSet::new();
+    for edge in &edges {
+        let source = edge.get("source").and_then(Value::as_str);
+        let target = edge.get("target").and_then(Value::as_str);
+        if source == Some(node_id) {
+            if let Some(target) = target {
+                related_ids.insert(target);
+            }
+        } else if target == Some(node_id) {
+            if let Some(source) = source {
+                related_ids.insert(source);
+            }
+        }
+    }
+    let related_nodes = nodes
+        .iter()
+        .filter(|node| {
+            node.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| related_ids.contains(id))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let completion_criteria = completion_criteria
+        .iter()
+        .map(|criterion| criterion.trim().to_owned())
+        .collect::<Vec<_>>();
+    let serialized_criteria =
+        serde_json::to_string(&completion_criteria).map_err(|error| error.to_string())?;
+    tx.execute(
+        "INSERT INTO development_units (project_id, map_revision, node_id, goal, completion_criteria)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![project_id, map_revision, node_id, goal, serialized_criteria],
+    )
+    .map_err(|error| error.to_string())?;
+    let id = tx.last_insert_rowid();
+    let unit = DevelopmentUnit {
+        id,
+        map_revision,
+        node_id: node_id.to_owned(),
+        goal: goal.to_owned(),
+        completion_criteria,
+        selected_node: selected_node.clone(),
+        related_nodes,
+    };
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(unit)
+}
+
+pub(crate) fn update_development_unit_status(
+    conn: &Connection,
+    unit_id: i64,
+    status: &str,
+    detail: Option<&str>,
+) -> Result<(), String> {
+    if !matches!(status, "started" | "start_failed") {
+        return Err("Invalid development-unit status transition".into());
+    }
+    let detail = detail.map(|value| value.chars().take(1_000).collect::<String>());
+    let updated = conn
+        .execute(
+            "UPDATE development_units
+             SET status = ?1, status_detail = ?2,
+                 started_at = CASE WHEN ?1 = 'started' THEN CURRENT_TIMESTAMP ELSE started_at END
+             WHERE id = ?3 AND status IN ('confirmed', 'started')",
+            rusqlite::params![status, detail.as_deref(), unit_id],
+        )
+        .map_err(|error| error.to_string())?;
+    if updated != 1 {
+        return Err("Development unit is no longer awaiting start".into());
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredDevelopmentUnit {
+    id: i64,
+    project_id: i64,
+    map_revision: i64,
+    node_id: String,
+    goal: String,
+    completion_criteria: Vec<String>,
+    status: String,
+    status_detail: Option<String>,
+    created_at: String,
+    started_at: Option<String>,
+}
+
+#[tauri::command]
+fn project_development_units(
+    app: tauri::AppHandle,
+    project_id: i64,
+) -> Result<Vec<StoredDevelopmentUnit>, String> {
+    let conn = database(&app)?;
+    ensure_project(&conn, project_id)?;
+    let mut statement = conn
+        .prepare(
+            "SELECT id, map_revision, node_id, goal, completion_criteria, status,
+                    status_detail, created_at, started_at
+             FROM development_units WHERE project_id = ?1 ORDER BY id DESC",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([project_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    rows.map(|row| {
+        let (
+            id,
+            map_revision,
+            node_id,
+            goal,
+            criteria,
+            status,
+            status_detail,
+            created_at,
+            started_at,
+        ) = row.map_err(|error| error.to_string())?;
+        Ok(StoredDevelopmentUnit {
+            id,
+            project_id,
+            map_revision,
+            node_id,
+            goal,
+            completion_criteria: serde_json::from_str(&criteria)
+                .map_err(|error| error.to_string())?,
+            status,
+            status_detail,
+            created_at,
+            started_at,
+        })
+    })
+    .collect()
+}
+
 #[tauri::command]
 fn update_design_draft(
     app: tauri::AppHandle,
@@ -644,7 +1056,7 @@ fn resolve_design_draft_in_db(
     let updated_map = tx
         .execute(
             "UPDATE project_maps SET nodes = ?1, edges = ?2, revision = revision + 1
-             WHERE project_id = ?3 AND revision = ?4 AND nodes = '[]'",
+             WHERE project_id = ?3 AND revision = ?4",
             rusqlite::params![nodes, edges, project_id, base_revision],
         )
         .map_err(|error| error.to_string())?;
@@ -824,10 +1236,11 @@ pub fn run() {
             reopen_project,
             project_has_content,
             load_project_map,
-            save_project_map,
+            create_map_edit_draft,
             create_design_draft,
             pending_design_draft,
             development_ready,
+            project_development_units,
             update_design_draft,
             resolve_design_draft,
             revise_design_draft,
@@ -862,7 +1275,9 @@ mod tests {
 
     fn sample_map() -> ProjectMap {
         ProjectMap {
-            nodes: vec![json!({"id":"a","type":"component","position":{"x":0,"y":0},"data":{}})],
+            nodes: vec![
+                json!({"id":"a","type":"component","position":{"x":0,"y":0},"data":{"title":"A","summary":"Owns A within its defined scope","responsibilities":["Provide A"],"status":"Not started"}}),
+            ],
             edges: vec![],
             revision: 0,
         }
@@ -871,8 +1286,9 @@ mod tests {
     #[test]
     fn invalid_edges_and_duplicate_nodes_are_rejected() {
         let mut map = sample_map();
-        map.edges
-            .push(json!({"id":"e","source":"a","target":"missing"}));
+        map.edges.push(
+            json!({"id":"e","source":"a","target":"missing","data":{"relation":"depends_on"}}),
+        );
         assert!(validate_map(&map.nodes, &map.edges).is_err());
         map.edges.clear();
         map.nodes.push(map.nodes[0].clone());
@@ -880,8 +1296,29 @@ mod tests {
     }
 
     #[test]
-    fn design_draft_requires_unimplemented_nodes_and_valid_edges() {
-        let node = json!({"id":"n1","type":"component","position":{"x":0,"y":0},"data":{"title":"Notes","summary":"Manage notes","status":"Not started"}});
+    fn map_edges_require_a_supported_relation_between_components() {
+        let mut map = sample_map();
+        map.nodes.push(json!({"id":"b","type":"component","position":{"x":1,"y":0},"data":{"title":"B","summary":"Owns B within its defined scope","responsibilities":["Provide B"],"status":"Not started"}}));
+        map.edges
+            .push(json!({"id":"e","source":"a","target":"b","data":{"relation":"depends_on"}}));
+        assert!(validate_map(&map.nodes, &map.edges).is_ok());
+
+        map.edges[0]["data"]["relation"] = json!("related");
+        assert!(validate_map(&map.nodes, &map.edges).is_err());
+        map.edges[0]["data"]["relation"] = json!("interacts_with");
+        assert!(validate_map(&map.nodes, &map.edges).is_ok());
+        map.edges[0].as_object_mut().unwrap().remove("data");
+        assert!(validate_map(&map.nodes, &map.edges).is_err());
+
+        map.edges[0]["data"] = json!({"relation":"interacts_with"});
+        map.edges[0]["target"] = json!("layer-a");
+        map.nodes.push(json!({"id":"layer-a","type":"layer","position":{"x":0,"y":0},"data":{"label":"Group","tone":"blue"}}));
+        assert!(validate_map(&map.nodes, &map.edges).is_err());
+    }
+
+    #[test]
+    fn design_draft_requires_valid_nodes_and_edges() {
+        let node = json!({"id":"n1","type":"component","position":{"x":0,"y":0},"data":{"title":"Notes","summary":"Manage notes within the note-taking scope","responsibilities":["Create and edit notes"],"status":"Not started"}});
         let mut draft = DesignDraft {
             goal: "Build a note app".into(),
             nodes: vec![node.clone()],
@@ -890,13 +1327,203 @@ mod tests {
             assumptions: vec![],
         };
         assert!(validate_design_draft(&draft).is_ok());
-        draft
-            .edges
-            .push(json!({"id":"e1","source":"n1","target":"missing"}));
+        draft.edges.push(
+            json!({"id":"e1","source":"n1","target":"missing","data":{"relation":"depends_on"}}),
+        );
         assert!(validate_design_draft(&draft).is_err());
         draft.edges.clear();
-        draft.nodes[0]["data"]["status"] = json!("Implemented");
+        draft.nodes[0]["data"]["responsibilities"] = json!([]);
         assert!(validate_design_draft(&draft).is_err());
+    }
+
+    #[test]
+    fn map_edits_do_not_change_confirmed_state_until_approved() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let root = canonical_project(&std::env::current_dir().unwrap()).unwrap();
+        conn.execute(
+            "INSERT INTO projects (id, name, root) VALUES (1, 'test', ?1)",
+            [&root],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO project_maps (project_id) VALUES (1)", [])
+            .unwrap();
+
+        let initial = sample_map();
+        assert_eq!(save_map(&conn, 1, &initial).unwrap(), 1);
+        let accepted_design = DesignDraft {
+            goal: "Architecture baseline".into(),
+            nodes: initial.nodes.clone(),
+            edges: initial.edges.clone(),
+            questions: vec![],
+            assumptions: vec![],
+        };
+        conn.execute(
+            "INSERT INTO design_drafts (project_id, base_revision, version, draft, state) VALUES (1, 0, 1, ?1, 'accepted')",
+            [serde_json::to_string(&accepted_design).unwrap()],
+        )
+        .unwrap();
+        assert!(has_current_approved_map(&conn, 1).unwrap());
+
+        let mut first_edit = ProjectMap {
+            nodes: initial.nodes.clone(),
+            edges: initial.edges.clone(),
+            revision: 1,
+        };
+        first_edit.nodes[0]["data"]["summary"] = json!("A revised scope");
+        let repeated_edit = ProjectMap {
+            nodes: first_edit.nodes.clone(),
+            edges: first_edit.edges.clone(),
+            revision: first_edit.revision,
+        };
+        let pending = persist_map_edit_draft(&mut conn, 1, first_edit).unwrap();
+        assert_eq!(pending.draft.base_revision, 1);
+        assert_eq!(pending.confirmed_map.revision, 1);
+        assert_eq!(
+            pending.confirmed_map.nodes[0]["data"]["summary"],
+            "Owns A within its defined scope"
+        );
+        assert_eq!(
+            pending.draft.draft.nodes[0]["data"]["summary"],
+            "A revised scope"
+        );
+        assert!(persist_map_edit_draft(&mut conn, 1, repeated_edit).is_err());
+        assert!(has_current_approved_map(&conn, 1).unwrap());
+
+        assert!(
+            resolve_design_draft_in_db(
+                &mut conn,
+                1,
+                pending.draft.id,
+                pending.draft.version,
+                false
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(has_current_approved_map(&conn, 1).unwrap());
+
+        let mut second_edit = ProjectMap {
+            nodes: initial.nodes,
+            edges: initial.edges,
+            revision: 1,
+        };
+        second_edit.nodes[0]["data"]["summary"] = json!("Approved scope");
+        let pending = persist_map_edit_draft(&mut conn, 1, second_edit).unwrap();
+        let approved =
+            resolve_design_draft_in_db(&mut conn, 1, pending.draft.id, pending.draft.version, true)
+                .unwrap()
+                .unwrap();
+        assert_eq!(approved.revision, 2);
+        assert_eq!(approved.nodes[0]["data"]["summary"], "Approved scope");
+        assert!(has_current_approved_map(&conn, 1).unwrap());
+    }
+
+    #[test]
+    fn development_unit_pins_approved_map_and_requires_completion_criteria() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let root = canonical_project(&std::env::current_dir().unwrap()).unwrap();
+        conn.execute(
+            "INSERT INTO projects (id, name, root) VALUES (1, 'test', ?1)",
+            [&root],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO project_maps (project_id) VALUES (1)", [])
+            .unwrap();
+
+        let mut map = sample_map();
+        assert_eq!(save_map(&conn, 1, &map).unwrap(), 1);
+        let criteria = vec![
+            "A record can be created".into(),
+            "The record remains after reload".into(),
+        ];
+        assert!(
+            record_development_unit(&mut conn, 1, 1, "a", "Must not start yet", &criteria,)
+                .is_err()
+        );
+        let approved_design = DesignDraft {
+            goal: "Baseline".into(),
+            nodes: map.nodes.clone(),
+            edges: map.edges.clone(),
+            questions: vec![],
+            assumptions: vec![],
+        };
+        conn.execute(
+            "INSERT INTO design_drafts (project_id, base_revision, version, draft, state) VALUES (1, 0, 1, ?1, 'accepted')",
+            [serde_json::to_string(&approved_design).unwrap()],
+        )
+        .unwrap();
+
+        let unit = record_development_unit(
+            &mut conn,
+            1,
+            1,
+            "a",
+            "Add persistent record creation",
+            &criteria,
+        )
+        .unwrap();
+        assert_eq!(unit.map_revision, 1);
+        assert_eq!(unit.selected_node["id"], "a");
+        assert_eq!(unit.completion_criteria, criteria);
+        let (status, stored_goal, stored_criteria): (String, String, String) = conn
+            .query_row(
+                "SELECT status, goal, completion_criteria FROM development_units WHERE id = ?1",
+                [unit.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "confirmed");
+        assert_eq!(stored_goal, "Add persistent record creation");
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&stored_criteria).unwrap(),
+            criteria
+        );
+        assert!(update_development_unit_status(&conn, unit.id, "started", None).is_ok());
+        assert!(
+            update_development_unit_status(&conn, unit.id, "start_failed", Some("CLI unavailable"))
+                .is_ok()
+        );
+
+        assert!(record_development_unit(&mut conn, 1, 0, "a", "A stale unit", &criteria,).is_err());
+        map.revision = 1;
+        map.nodes[0]["data"]["questions"] = json!(["Which format?"]);
+        assert_eq!(save_map(&conn, 1, &map).unwrap(), 2);
+        assert!(
+            record_development_unit(&mut conn, 1, 2, "a", "Resolve the format", &criteria,)
+                .is_err()
+        );
+        assert!(record_development_unit(&mut conn, 1, 2, "a", "Missing criteria", &[]).is_err());
+    }
+
+    #[test]
+    fn design_response_requires_responsibilities_and_typed_edges() {
+        let response = json!({
+            "goal":"Build a note app",
+            "nodes":[
+                {"id":"notes","title":"Notes","summary":"Owns creating and organizing notes, not account billing.","responsibilities":["Create and edit notes"],"questions":[]},
+                {"id":"storage","title":"Storage","summary":"Persists note data, not presentation.","responsibilities":["Persist notes"],"questions":[]}
+            ],
+            "edges":[{"id":"notes-storage","source":"notes","target":"storage","relation":"depends_on"}],
+            "questions":[],
+            "assumptions":[]
+        }).to_string();
+        let draft = parse_design_response(&response).unwrap();
+        assert_eq!(
+            draft.nodes[0]["data"]["responsibilities"][0],
+            "Create and edit notes"
+        );
+        assert_eq!(draft.nodes[1]["position"]["x"], 380);
+        assert_eq!(draft.edges[0]["data"]["relation"], "depends_on");
+        assert_eq!(draft.edges[0]["label"], "Depends on");
+        assert_eq!(draft.edges[0]["sourceHandle"], "source-right");
+        assert_eq!(draft.edges[0]["targetHandle"], "target-left");
+
+        let invalid_response = response.replace("depends_on", "related");
+        assert!(parse_design_response(&invalid_response).is_err());
     }
 
     #[test]
@@ -916,7 +1543,7 @@ mod tests {
         let draft = DesignDraft {
             goal: "Build a note app".into(),
             nodes: vec![
-                json!({"id":"n1","type":"component","position":{"x":0,"y":0},"data":{"title":"Notes","summary":"Manage notes","status":"Not started"}}),
+                json!({"id":"n1","type":"component","position":{"x":0,"y":0},"data":{"title":"Notes","summary":"Manage notes within the note-taking scope","responsibilities":["Create and edit notes"],"status":"Not started"}}),
             ],
             edges: vec![],
             questions: vec![],
@@ -964,7 +1591,7 @@ mod tests {
         let draft = DesignDraft {
             goal: "Build a note app".into(),
             nodes: vec![
-                json!({"id":"n1","type":"component","position":{"x":0,"y":0},"data":{"title":"Notes","summary":"Manage notes","status":"Not started"}}),
+                json!({"id":"n1","type":"component","position":{"x":0,"y":0},"data":{"title":"Notes","summary":"Manage notes within the note-taking scope","responsibilities":["Create and edit notes"],"status":"Not started"}}),
             ],
             edges: vec![],
             questions: vec![],
@@ -1022,7 +1649,7 @@ mod tests {
         let draft = DesignDraft {
             goal: "Build a note app".into(),
             nodes: vec![
-                json!({"id":"n1","type":"component","position":{"x":0,"y":0},"data":{"title":"Notes","summary":"Manage notes","status":"Not started"}}),
+                json!({"id":"n1","type":"component","position":{"x":0,"y":0},"data":{"title":"Notes","summary":"Manage notes within the note-taking scope","responsibilities":["Create and edit notes"],"status":"Not started"}}),
             ],
             edges: vec![],
             questions: vec![],
@@ -1085,7 +1712,7 @@ mod tests {
         let draft = DesignDraft {
             goal: "Build a note app".into(),
             nodes: vec![
-                json!({"id":"n1","type":"component","position":{"x":0,"y":0},"data":{"title":"Notes","summary":"Manage notes","status":"Not started"}}),
+                json!({"id":"n1","type":"component","position":{"x":0,"y":0},"data":{"title":"Notes","summary":"Manage notes within the note-taking scope","responsibilities":["Create and edit notes"],"status":"Not started"}}),
             ],
             edges: vec![],
             questions: vec![],

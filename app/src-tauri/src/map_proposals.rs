@@ -20,9 +20,9 @@ const OUTPUT_SCHEMA: &str = r#"{
       "files":{"type":"array","items":{"type":"string"}},"removeFiles":{"type":"array","items":{"type":"string"}},"reason":{"type":"string"},"evidence":{"type":"string"}
     },"required":["nodeId","summary","status","files","removeFiles","reason","evidence"]}},
     "additions":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{
-      "title":{"type":"string"},"summary":{"type":"string"},"status":{"type":"string"},
+      "title":{"type":"string"},"summary":{"type":"string"},"responsibilities":{"type":"array","items":{"type":"string"}},"status":{"type":"string"},
       "files":{"type":"array","items":{"type":"string"}},"reason":{"type":"string"},"evidence":{"type":"string"}
-    },"required":["title","summary","status","files","reason","evidence"]}},
+    },"required":["title","summary","responsibilities","status","files","reason","evidence"]}},
     "removals":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{
       "nodeId":{"type":"string"},"deletedFile":{"type":"string"},"reason":{"type":"string"}
     },"required":["nodeId","deletedFile","reason"]}}
@@ -46,6 +46,7 @@ struct NodeUpdate {
 struct NodeAddition {
     title: String,
     summary: String,
+    responsibilities: Vec<String>,
     status: String,
     files: Vec<String>,
     reason: String,
@@ -258,11 +259,15 @@ fn verify_changes(
             return Err("Proposal lacks a matching source excerpt".into());
         }
     }
-    if changes
-        .additions
-        .iter()
-        .any(|node| node.title.trim().is_empty() || node.title.len() > 120)
-    {
+    if changes.additions.iter().any(|node| {
+        node.title.trim().is_empty()
+            || node.title.len() > 120
+            || node.responsibilities.is_empty()
+            || node
+                .responsibilities
+                .iter()
+                .any(|item| item.trim().is_empty() || item.len() > 1_000)
+    }) {
         return Err("Invalid new node title".into());
     }
     Ok(())
@@ -303,8 +308,8 @@ fn apply_changes(
             "id": format!("agent-{proposal_id}-{index}"), "type": "component",
             "position": {"x": 80 + (index % 4) * 240, "y": 120 + (index / 4) * 130},
             "data": {"title": addition.title, "summary": addition.summary, "status": addition.status,
-                "files": addition.files, "kind": "Component", "technology": "Not specified",
-                "icon": "map", "responsibilities": []}
+                "files": addition.files, "kind": "System responsibility", "technology": "Not specified",
+                "icon": "map", "responsibilities": addition.responsibilities}
         }));
     }
     let removed: HashSet<&str> = changes
@@ -396,7 +401,7 @@ pub async fn propose_map_update(
     std::fs::write(directory.join("map-proposal-schema.json"), OUTPUT_SCHEMA)
         .map_err(|error| error.to_string())?;
     let prompt = format!(
-        "Do not call tools. Heim has already read the changed source below. Maintain the project map so it reflects implemented source, not just the prior plan. If the changed files contain no map-relevant implementation change, return empty updates, additions, and removals. If source exports a new function or implements a feature absent from the map, return a new component in additions (a generic goal node is not a match). Update an existing matching component by nodeId instead. For each source-backed addition/update copy a short contiguous excerpt from the supplied file into evidence, preserving the source words exactly except for whitespace. Do not use ellipses, summaries, markdown fences, or invented text in evidence, and link its changed file. On deletion, remove a node only if its sole linked file was deleted: use removals with nodeId, deletedFile and reason. For a node with other linked files, use updates with removeFiles containing the deleted path, files empty when no other changed sources are relevant, and evidence exactly DELETED:<path>. Never propose an inability-to-inspect placeholder. Do not modify files.\nChanged source: {}\nDeleted paths: {}\nCurrent map nodes: {}",
+        "Do not call tools. Heim has already read the changed source below. Maintain the logical architecture map so it reflects implemented system responsibilities, not just the prior plan. If changed files do not establish a new persistent system responsibility or change an existing responsibility, return empty updates, additions, and removals. Do not create nodes for individual functions, files, classes, or one-off tasks. Add a node only for a distinct, durable responsibility absent from the map; include its responsibility-and-scope summary and at least one responsibility. Update an existing matching responsibility by nodeId instead. For each source-backed addition/update copy a short contiguous excerpt from the supplied file into evidence, preserving the source words exactly except for whitespace. Do not use ellipses, summaries, markdown fences, or invented text in evidence, and link its changed file. On deletion, remove a node only if its sole linked file was deleted: use removals with nodeId, deletedFile and reason. For a node with other linked files, use updates with removeFiles containing the deleted path, files empty when no other changed sources are relevant, and evidence exactly DELETED:<path>. Never propose an inability-to-inspect placeholder. Do not modify files.\nChanged source: {}\nDeleted paths: {}\nCurrent map nodes: {}",
         json!(contents),
         json!(deleted),
         json!(map.nodes)
@@ -652,7 +657,7 @@ mod tests {
     fn applies_existing_and_new_nodes_without_discarding_existing_files() {
         let mut map = ProjectMap {
             nodes: vec![
-                json!({"id":"a","type":"component","position":{"x":0,"y":0},"data":{"summary":"old","files":["existing.rs"]}}),
+                json!({"id":"a","type":"component","position":{"x":0,"y":0},"data":{"title":"Existing","summary":"Owns existing behavior","responsibilities":["Provide existing behavior"],"status":"In progress","files":["existing.rs"]}}),
             ],
             edges: vec![],
             revision: 0,
@@ -670,6 +675,7 @@ mod tests {
             additions: vec![NodeAddition {
                 title: "New module".into(),
                 summary: "new behavior".into(),
+                responsibilities: vec!["Provide new behavior".into()],
                 status: "Complete".into(),
                 files: vec!["src/new.rs".into()],
                 reason: "new export".into(),
@@ -695,6 +701,10 @@ mod tests {
         assert_eq!(map.nodes[0]["data"]["summary"], "implemented");
         assert_eq!(map.nodes[1]["id"], "agent-7-0");
         assert_eq!(map.nodes[1]["data"]["files"], json!(["src/new.rs"]));
+        assert_eq!(
+            map.nodes[1]["data"]["responsibilities"],
+            json!(["Provide new behavior"])
+        );
     }
 
     #[test]
@@ -710,10 +720,12 @@ mod tests {
     fn deleted_feature_removes_node_and_its_edges() {
         let mut map = ProjectMap {
             nodes: vec![
-                json!({"id":"a","type":"component","position":{"x":0,"y":0},"data":{"files":["old.js"]}}),
-                json!({"id":"b","type":"component","position":{"x":1,"y":1},"data":{"files":["keep.js"]}}),
+                json!({"id":"a","type":"component","position":{"x":0,"y":0},"data":{"title":"A","summary":"Owns A","responsibilities":["Provide A"],"status":"Implemented","files":["old.js"]}}),
+                json!({"id":"b","type":"component","position":{"x":1,"y":1},"data":{"title":"B","summary":"Owns B","responsibilities":["Provide B"],"status":"Implemented","files":["keep.js"]}}),
             ],
-            edges: vec![json!({"id":"ab","source":"a","target":"b"})],
+            edges: vec![
+                json!({"id":"ab","source":"a","target":"b","data":{"relation":"interacts_with"}}),
+            ],
             revision: 0,
         };
         let changes = MapChanges {

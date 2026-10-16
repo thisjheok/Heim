@@ -1,5 +1,11 @@
 import { MarkerType, type Edge, type Node } from '@xyflow/react'
 
+export type MapRelation = 'depends_on' | 'interacts_with'
+export type HeimEdge = Edge<{ relation: MapRelation }>
+
+export const relationLabel = (relation: MapRelation) =>
+  relation === 'depends_on' ? 'Depends on' : 'Interacts with'
+
 export type ComponentIcon =
   | 'desktop'
   | 'map'
@@ -188,19 +194,38 @@ export const initialNodes: HeimNode[] = [
 ]
 
 const edgeStyle = { stroke: '#aeb8c9', strokeWidth: 1.6 }
+const edgeHandles = (source: string, target: string) => {
+  const sourcePosition = initialNodes.find((node) => node.id === source)?.position ?? { x: 0, y: 0 }
+  const targetPosition = initialNodes.find((node) => node.id === target)?.position ?? { x: 0, y: 0 }
+  const dx = targetPosition.x - sourcePosition.x
+  const dy = targetPosition.y - sourcePosition.y
+  if (Math.abs(dx) >= Math.abs(dy)) {
+    return dx >= 0
+      ? { sourceHandle: 'source-right', targetHandle: 'target-left' }
+      : { sourceHandle: 'source-left', targetHandle: 'target-right' }
+  }
+  return dy >= 0
+    ? { sourceHandle: 'source-bottom', targetHandle: 'target-top' }
+    : { sourceHandle: 'source-top', targetHandle: 'target-bottom' }
+}
 
-export const initialEdges: Edge[] = [
-  { id: 'ui-map', source: 'heim-ui', target: 'project-map', style: edgeStyle },
-  { id: 'map-agent', source: 'project-map', target: 'agent-host', style: edgeStyle },
-  {
-    id: 'host-cli',
-    source: 'agent-host',
-    target: 'agent-cli',
-    style: edgeStyle,
-    markerEnd: { type: MarkerType.ArrowClosed, color: '#aeb8c9' },
-  },
-  { id: 'host-context', source: 'agent-host', target: 'mcp-context', style: edgeStyle },
-  { id: 'context-store', source: 'mcp-context', target: 'sqlite-store', style: edgeStyle },
-  { id: 'host-guard', source: 'agent-host', target: 'workspace-guard', style: edgeStyle },
-  { id: 'guard-review', source: 'workspace-guard', target: 'change-review', style: edgeStyle },
+const edge = (id: string, source: string, target: string, relation: MapRelation): HeimEdge => ({
+  id,
+  source,
+  target,
+  ...edgeHandles(source, target),
+  data: { relation },
+  label: relationLabel(relation),
+  style: edgeStyle,
+  markerEnd: { type: MarkerType.ArrowClosed, color: '#aeb8c9' },
+})
+
+export const initialEdges: HeimEdge[] = [
+  edge('ui-map', 'heim-ui', 'project-map', 'interacts_with'),
+  edge('map-agent', 'project-map', 'agent-host', 'interacts_with'),
+  edge('host-cli', 'agent-host', 'agent-cli', 'interacts_with'),
+  edge('host-context', 'agent-host', 'mcp-context', 'interacts_with'),
+  edge('context-store', 'mcp-context', 'sqlite-store', 'depends_on'),
+  edge('host-guard', 'agent-host', 'workspace-guard', 'depends_on'),
+  edge('guard-review', 'workspace-guard', 'change-review', 'interacts_with'),
 ]

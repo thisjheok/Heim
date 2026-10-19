@@ -4,13 +4,14 @@ use std::{
     process::Stdio,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     },
     time::SystemTime,
 };
 
 use serde::Serialize;
 use serde_json::{Value, json};
+
 use tauri::{AppHandle, Emitter, State};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -19,7 +20,14 @@ use tokio::{
     time::{Duration, timeout},
 };
 
-use crate::{database, ensure_project, record_development_unit, update_development_unit_status};
+use crate::{
+    DevelopmentUnitSpec, create_development_unit_run, database, ensure_project,
+    has_current_approved_map, load_development_unit_spec, node_has_unanswered_questions,
+    record_development_unit, record_development_unit_run_evidence,
+    save_development_unit_run_report, store_generated_development_unit_spec,
+    transition_development_unit_run, update_development_unit_status,
+    validate_development_unit_spec,
+};
 
 #[derive(Default)]
 pub struct AgentManager {
@@ -29,6 +37,13 @@ pub struct AgentManager {
 pub(crate) struct DesignResponse {
     pub text: String,
     pub revision: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DevelopmentStartResult {
+    unit_id: i64,
+    run_id: i64,
 }
 
 struct Session {
@@ -45,6 +60,249 @@ struct Session {
     turn_id: Arc<Mutex<Option<String>>>,
     snapshot: Arc<Mutex<Option<FileSnapshot>>>,
     response: Arc<Mutex<Option<String>>>,
+    expected_response: Arc<Mutex<Option<ResponseExpectation>>>,
+    active_run_id: Arc<AtomicI64>,
+}
+
+#[derive(Clone, Debug)]
+struct ResponseExpectation {
+    mode: AgentMode,
+    map_revision: i64,
+    draft_id: Option<i64>,
+    draft_version: Option<i64>,
+    unit_id: Option<i64>,
+    node_id: Option<String>,
+    criteria_count: usize,
+    result_kind: &'static str,
+}
+
+fn validate_agent_response(
+    text: &str,
+    expected: &ResponseExpectation,
+) -> Result<(Value, String), String> {
+    if text.len() > 200_000 {
+        return Err("Agent response exceeds the 200000-byte limit".into());
+    }
+    let envelope: Value =
+        serde_json::from_str(text).map_err(|_| "Agent response is not valid contract JSON")?;
+    if envelope["contractVersion"] != 1
+        || envelope["mode"].as_str()
+            != Some(match expected.mode {
+                AgentMode::Design => "design",
+                AgentMode::Development => "development",
+            })
+    {
+        return Err("Agent response has the wrong contract version or mode".into());
+    }
+    let context = &envelope["context"];
+    if context.get("mapRevision").and_then(Value::as_i64) != Some(expected.map_revision)
+        || context.get("draftId").is_none()
+        || context.get("draftVersion").is_none()
+        || context.get("unitId").is_none()
+        || context.get("draftId").and_then(Value::as_i64) != expected.draft_id
+        || context.get("draftVersion").and_then(Value::as_i64) != expected.draft_version
+        || context.get("unitId").and_then(Value::as_i64) != expected.unit_id
+    {
+        return Err("Agent response context does not match the request snapshot".into());
+    }
+    let result = &envelope["result"];
+    if result["kind"].as_str() != Some(expected.result_kind) {
+        return Err("Agent response has an unexpected result kind".into());
+    }
+    let display = match expected.result_kind {
+        "discussion" => result["message"]
+            .as_str()
+            .filter(|message| !message.trim().is_empty() && message.len() <= 20_000)
+            .ok_or("Agent response message is missing or too long")
+            .and_then(|message| {
+                for field in ["questions", "assumptions"] {
+                    if !result[field]
+                        .as_array()
+                        .is_some_and(|items| items.iter().all(Value::is_string))
+                    {
+                        return Err(
+                            "Design discussion questions and assumptions must be string arrays"
+                                .into(),
+                        );
+                    }
+                }
+                Ok(message.to_owned())
+            })?,
+        "map_draft" => {
+            let message = result["message"]
+                .as_str()
+                .filter(|message| !message.trim().is_empty() && message.len() <= 20_000)
+                .ok_or("Agent response message is missing or too long")?;
+            if !result["draft"]["goal"].is_string()
+                || !result["draft"]["nodes"].is_array()
+                || !result["draft"]["edges"].is_array()
+                || !result["draft"]["questions"].is_array()
+                || !result["draft"]["assumptions"].is_array()
+            {
+                return Err("Structured map draft payload is incomplete".into());
+            }
+            message.to_owned()
+        }
+        "unit_plan" => {
+            if result["nodeId"].as_str() != expected.node_id.as_deref() {
+                return Err("AI unit plan refers to a different map node".into());
+            }
+            let goal = result["goal"]
+                .as_str()
+                .filter(|goal| !goal.trim().is_empty() && goal.len() <= 4_000)
+                .ok_or("AI unit plan goal is missing or too long")?;
+            let criteria = result["completionCriteria"]
+                .as_array()
+                .filter(|criteria| !criteria.is_empty() && criteria.len() <= 20)
+                .ok_or("AI unit plan must include 1-20 completion criteria")?;
+            if criteria.iter().any(|criterion| {
+                criterion.as_str().map_or(true, |criterion| {
+                    criterion.trim().is_empty() || criterion.len() > 1_000
+                })
+            }) {
+                return Err("AI unit plan contains an invalid completion criterion".into());
+            }
+            goal.to_owned()
+        }
+        "development_report" => {
+            let summary = result["summary"]
+                .as_str()
+                .filter(|summary| !summary.trim().is_empty() && summary.len() <= 20_000)
+                .ok_or("Development report summary is missing or too long")?;
+            if !matches!(
+                result["outcome"].as_str(),
+                Some("completed" | "incomplete" | "blocked")
+            ) {
+                return Err("Development report has an invalid outcome".into());
+            }
+            let criteria = result["criteria"]
+                .as_array()
+                .ok_or("Development report criteria are missing")?;
+            if criteria.len() != expected.criteria_count
+                || criteria.iter().enumerate().any(|(index, item)| {
+                    item["index"].as_u64() != Some(index as u64)
+                        || !matches!(item["status"].as_str(), Some("met" | "not_met" | "not_run"))
+                        || !item["evidence"].as_array().is_some_and(|evidence| {
+                            evidence.iter().all(|entry| entry.as_str().is_some())
+                        })
+                })
+            {
+                return Err(
+                    "Development report does not assess each requested criterion exactly once"
+                        .into(),
+                );
+            }
+            let changes = result["changes"]
+                .as_array()
+                .ok_or("Development report changes are missing")?;
+            let checks = result["checks"]
+                .as_array()
+                .ok_or("Development report checks are missing")?;
+            let blockers = result["blockers"]
+                .as_array()
+                .ok_or("Development report blockers are missing")?;
+            if changes.iter().any(|change| {
+                change["path"].as_str().map_or(true, str::is_empty)
+                    || change["summary"].as_str().map_or(true, str::is_empty)
+            }) || checks.iter().any(|check| {
+                check["command"].as_str().map_or(true, str::is_empty)
+                    || check["summary"].as_str().map_or(true, str::is_empty)
+                    || !matches!(
+                        check["status"].as_str(),
+                        Some("passed" | "failed" | "not_run")
+                    )
+            }) || blockers.iter().any(|blocker| blocker.as_str().is_none())
+            {
+                return Err(
+                    "Development report contains an invalid change, check, or blocker".into(),
+                );
+            }
+            let outcome = result["outcome"].as_str().unwrap_or("unknown");
+            let all_met = criteria
+                .iter()
+                .all(|criterion| criterion["status"] == "met");
+            if (outcome == "completed") != all_met
+                || (outcome == "blocked" && blockers.is_empty())
+                || (outcome == "completed" && !blockers.is_empty())
+            {
+                return Err(
+                    "Development report outcome conflicts with its criteria or blockers".into(),
+                );
+            }
+            let criteria_text = criteria
+                .iter()
+                .map(|criterion| {
+                    let evidence = criterion["evidence"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    format!(
+                        "- Criterion {}: {}{}",
+                        criterion["index"],
+                        criterion["status"].as_str().unwrap_or("unknown"),
+                        if evidence.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" — {evidence}")
+                        }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let changes_text = changes
+                .iter()
+                .map(|change| {
+                    format!(
+                        "- {} — {}",
+                        change["path"].as_str().unwrap_or(""),
+                        change["summary"].as_str().unwrap_or("")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let checks_text = checks
+                .iter()
+                .map(|check| {
+                    format!(
+                        "- {}: {} — {}",
+                        check["status"].as_str().unwrap_or("unknown"),
+                        check["command"].as_str().unwrap_or(""),
+                        check["summary"].as_str().unwrap_or("")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let blockers_text = blockers
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|blocker| format!("- {blocker}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "Agent-reported status (not independently verified by Heim)\nOutcome: {outcome}\n{summary}\n\nCompletion criteria:\n{criteria_text}\n\nReported changes:\n{}\n\nChecks:\n{}\n\nBlockers:\n{}",
+                if changes_text.is_empty() {
+                    "- None reported"
+                } else {
+                    &changes_text
+                },
+                if checks_text.is_empty() {
+                    "- None reported"
+                } else {
+                    &checks_text
+                },
+                if blockers_text.is_empty() {
+                    "- None"
+                } else {
+                    &blockers_text
+                }
+            )
+        }
+        _ => return Err("Unsupported Agent response contract".into()),
+    };
+    Ok((result.clone(), display))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -224,6 +482,41 @@ fn item_id(params: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn terminal_development_run_state<'a>(
+    turn_status: &'a str,
+    error: Option<&'a str>,
+) -> (&'static str, Option<&'a str>) {
+    if turn_status == "completed" && error.is_none() {
+        ("finished", None)
+    } else if matches!(turn_status, "interrupted" | "cancelled" | "canceled") {
+        ("interrupted", error.or(Some(turn_status)))
+    } else {
+        ("failed", error.or(Some(turn_status)))
+    }
+}
+
+fn command_for_persistent_evidence(command: &str) -> String {
+    let lowered = command.to_ascii_lowercase();
+    if [
+        "--token",
+        "--password",
+        "--secret",
+        "--api-key",
+        "apikey=",
+        "token=",
+        "password=",
+        "secret=",
+        "authorization:",
+        "bearer ",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker))
+    {
+        return "[redacted command containing a credential-like argument]".into();
+    }
+    command.chars().take(4_000).collect()
+}
+
 fn command_is_safe(command: &str) -> bool {
     let command = command.to_ascii_lowercase();
     let risky = [
@@ -302,6 +595,8 @@ async fn read_events(
     turn_id: Arc<Mutex<Option<String>>>,
     snapshot: Arc<Mutex<Option<FileSnapshot>>>,
     response: Arc<Mutex<Option<String>>>,
+    expected_response: Arc<Mutex<Option<ResponseExpectation>>>,
+    active_run_id: Arc<AtomicI64>,
     root: PathBuf,
 ) {
     let mut lines = BufReader::new(stdout).lines();
@@ -386,32 +681,35 @@ async fn read_events(
                     .pointer("/turn/id")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
-                emit(&app, project_id, "status", "Agent is working…", None, None);
+                let run_id = active_run_id.load(Ordering::Acquire);
+                if run_id > 0 {
+                    match database(&app).and_then(|conn| {
+                        transition_development_unit_run(&conn, run_id, "running", None).map(|_| ())
+                    }) {
+                        Ok(()) => {}
+                        Err(error) => emit(
+                            &app,
+                            project_id,
+                            "status",
+                            format!("Could not record development run start: {error}"),
+                            None,
+                            None,
+                        ),
+                    }
+                }
+                let internal_plan = expected_response
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|expected| expected.result_kind == "unit_plan");
+                if !internal_plan {
+                    emit(&app, project_id, "status", "Agent is working…", None, None);
+                }
             }
             "turn/completed" => {
                 *turn_id.lock().await = None;
                 approvals.lock().await.clear();
-                if let Some(before) = snapshot.lock().await.take() {
-                    let after = tokio::task::spawn_blocking({
-                        let root = root.clone();
-                        move || file_snapshot(&root)
-                    })
-                    .await;
-                    if let Ok(after) = after {
-                        let files = changed_files(&before, &after);
-                        if !files.is_empty() {
-                            emit(
-                                &app,
-                                project_id,
-                                "changed",
-                                json!(files).to_string(),
-                                None,
-                                None,
-                            );
-                        }
-                    }
-                }
-                busy.store(false, Ordering::Release);
+                let run_id = active_run_id.swap(0, Ordering::AcqRel);
                 let status = params
                     .pointer("/turn/status")
                     .and_then(Value::as_str)
@@ -419,17 +717,113 @@ async fn read_events(
                 let error = params
                     .pointer("/turn/error/message")
                     .and_then(Value::as_str);
-                emit(
-                    &app,
-                    project_id,
-                    "done",
-                    error.unwrap_or(status),
-                    None,
-                    None,
-                );
+                if run_id > 0 {
+                    let (run_state, detail) = terminal_development_run_state(status, error);
+                    match database(&app).and_then(|conn| {
+                        transition_development_unit_run(&conn, run_id, run_state, detail)
+                            .map(|_| ())
+                    }) {
+                        Ok(()) => {}
+                        Err(error) => emit(
+                            &app,
+                            project_id,
+                            "status",
+                            format!("Could not record development run outcome: {error}"),
+                            None,
+                            None,
+                        ),
+                    }
+                }
+                if let Some(before) = snapshot.lock().await.take() {
+                    let after = tokio::task::spawn_blocking({
+                        let root = root.clone();
+                        move || file_snapshot(&root)
+                    })
+                    .await;
+                    match after {
+                        Ok(after) => {
+                            let files = changed_files(&before, &after);
+                            if run_id > 0 {
+                                let evidence = json!({"available":true,"changedFiles":files});
+                                if let Err(error) = database(&app).and_then(|conn| {
+                                    record_development_unit_run_evidence(
+                                        &conn,
+                                        run_id,
+                                        "workspace_snapshot",
+                                        &evidence,
+                                    )
+                                }) {
+                                    emit(
+                                        &app,
+                                        project_id,
+                                        "status",
+                                        format!("Could not persist workspace evidence: {error}"),
+                                        None,
+                                        None,
+                                    );
+                                }
+                            }
+                            if !files.is_empty() {
+                                emit(
+                                    &app,
+                                    project_id,
+                                    "changed",
+                                    json!(files).to_string(),
+                                    None,
+                                    None,
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            if run_id > 0 {
+                                let evidence = json!({"available":false,"error":error.to_string()});
+                                if let Err(error) = database(&app).and_then(|conn| {
+                                    record_development_unit_run_evidence(
+                                        &conn,
+                                        run_id,
+                                        "workspace_snapshot",
+                                        &evidence,
+                                    )
+                                }) {
+                                    emit(
+                                        &app,
+                                        project_id,
+                                        "status",
+                                        format!(
+                                            "Could not persist unavailable workspace evidence: {error}"
+                                        ),
+                                        None,
+                                        None,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                busy.store(false, Ordering::Release);
+                let internal_plan = expected_response
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|expected| expected.result_kind == "unit_plan");
+                if !internal_plan {
+                    emit(
+                        &app,
+                        project_id,
+                        "done",
+                        error.unwrap_or(status),
+                        None,
+                        None,
+                    );
+                }
             }
             "item/agentMessage/delta" => {
-                if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+                let internal_plan = expected_response
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|expected| expected.result_kind == "unit_plan");
+                if !internal_plan && let Some(delta) = params.get("delta").and_then(Value::as_str) {
                     emit(&app, project_id, "delta", delta, item_id(params), None);
                 }
             }
@@ -438,8 +832,73 @@ async fn read_events(
                 match item.get("type").and_then(Value::as_str) {
                     Some("agentMessage") => {
                         if let Some(text) = item.get("text").and_then(Value::as_str) {
-                            *response.lock().await = Some(text.to_owned());
-                            emit(&app, project_id, "message", text, item_id(params), None);
+                            let expected = expected_response.lock().await.clone();
+                            let Some(expected) = expected else {
+                                emit(
+                                    &app,
+                                    project_id,
+                                    "protocol_error",
+                                    "No response contract is active for this Agent turn",
+                                    item_id(params),
+                                    None,
+                                );
+                                continue;
+                            };
+                            match validate_agent_response(text, &expected) {
+                                Ok((result, display)) => {
+                                    let persist = if expected.mode == AgentMode::Development {
+                                        let run_id = active_run_id.load(Ordering::Acquire);
+                                        if run_id <= 0 {
+                                            Err("No active development run is associated with this report".into())
+                                        } else {
+                                            database(&app).and_then(|mut conn| {
+                                                save_development_unit_run_report(
+                                                    &mut conn, run_id, &result,
+                                                )
+                                            })
+                                        }
+                                    } else {
+                                        Ok(())
+                                    };
+                                    match persist {
+                                        Ok(()) => {
+                                            *response.lock().await = Some(text.to_owned());
+                                            if expected.result_kind != "unit_plan" {
+                                                emit(
+                                                    &app,
+                                                    project_id,
+                                                    "message",
+                                                    display,
+                                                    item_id(params),
+                                                    None,
+                                                );
+                                            }
+                                        }
+                                        Err(error) => emit(
+                                            &app,
+                                            project_id,
+                                            "protocol_error",
+                                            format!(
+                                                "Validated report could not be persisted: {error}"
+                                            ),
+                                            item_id(params),
+                                            None,
+                                        ),
+                                    }
+                                }
+                                Err(error) => {
+                                    if expected.result_kind != "unit_plan" {
+                                        emit(
+                                            &app,
+                                            project_id,
+                                            "protocol_error",
+                                            error,
+                                            item_id(params),
+                                            None,
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                     Some("commandExecution") => {
@@ -450,7 +909,34 @@ async fn read_events(
                         let status = item
                             .get("status")
                             .and_then(Value::as_str)
-                            .unwrap_or("finished");
+                            .unwrap_or("unknown");
+                        let run_id = active_run_id.load(Ordering::Acquire);
+                        if run_id > 0 {
+                            let evidence = json!({
+                                "command": command_for_persistent_evidence(command),
+                                "status": status,
+                                "exitCode": item.get("exitCode").and_then(Value::as_i64),
+                                "durationMs": item.get("durationMs").and_then(Value::as_u64),
+                                "itemId": item.get("id").and_then(Value::as_str),
+                            });
+                            if let Err(error) = database(&app).and_then(|conn| {
+                                record_development_unit_run_evidence(
+                                    &conn,
+                                    run_id,
+                                    "command_execution",
+                                    &evidence,
+                                )
+                            }) {
+                                emit(
+                                    &app,
+                                    project_id,
+                                    "status",
+                                    format!("Could not persist command evidence: {error}"),
+                                    None,
+                                    None,
+                                );
+                            }
+                        }
                         emit(
                             &app,
                             project_id,
@@ -492,6 +978,87 @@ async fn read_events(
     }
     busy.store(false, Ordering::Release);
     alive.store(false, Ordering::Release);
+    let run_id = active_run_id.swap(0, Ordering::AcqRel);
+    if run_id > 0 {
+        if let Err(error) = database(&app).and_then(|conn| {
+            transition_development_unit_run(
+                &conn,
+                run_id,
+                "disconnected",
+                Some("Agent process disconnected before the turn completed"),
+            )
+            .map(|_| ())
+        }) {
+            emit(
+                &app,
+                project_id,
+                "status",
+                format!("Could not record disconnected development run: {error}"),
+                None,
+                None,
+            );
+        }
+        if let Some(before) = snapshot.lock().await.take() {
+            let after = tokio::task::spawn_blocking({
+                let root = root.clone();
+                move || file_snapshot(&root)
+            })
+            .await;
+            match after {
+                Ok(after) => {
+                    let files = changed_files(&before, &after);
+                    let evidence = json!({"available":true,"changedFiles":files});
+                    if let Err(error) = database(&app).and_then(|conn| {
+                        record_development_unit_run_evidence(
+                            &conn,
+                            run_id,
+                            "workspace_snapshot",
+                            &evidence,
+                        )
+                    }) {
+                        emit(
+                            &app,
+                            project_id,
+                            "status",
+                            format!("Could not persist disconnected workspace evidence: {error}"),
+                            None,
+                            None,
+                        );
+                    }
+                    if !files.is_empty() {
+                        emit(
+                            &app,
+                            project_id,
+                            "changed",
+                            json!(files).to_string(),
+                            None,
+                            None,
+                        );
+                    }
+                }
+                Err(error) => {
+                    let evidence = json!({"available":false,"error":error.to_string()});
+                    if let Err(error) = database(&app).and_then(|conn| {
+                        record_development_unit_run_evidence(
+                            &conn,
+                            run_id,
+                            "workspace_snapshot",
+                            &evidence,
+                        )
+                    }) {
+                        emit(
+                            &app,
+                            project_id,
+                            "status",
+                            format!("Could not persist disconnected workspace evidence: {error}"),
+                            None,
+                            None,
+                        );
+                    }
+                }
+            }
+        }
+    }
     emit(
         &app,
         project_id,
@@ -528,6 +1095,8 @@ async fn start_session(
     let turn_id = Arc::new(Mutex::new(None));
     let snapshot = Arc::new(Mutex::new(None));
     let response = Arc::new(Mutex::new(None));
+    let expected_response = Arc::new(Mutex::new(None));
+    let active_run_id = Arc::new(AtomicI64::new(0));
     tokio::spawn(read_events(
         app.clone(),
         project_id,
@@ -540,6 +1109,8 @@ async fn start_session(
         turn_id.clone(),
         snapshot.clone(),
         response.clone(),
+        expected_response.clone(),
+        active_run_id.clone(),
         PathBuf::from(root),
     ));
     let mut session = Session {
@@ -556,6 +1127,8 @@ async fn start_session(
         turn_id,
         snapshot,
         response,
+        expected_response,
+        active_run_id,
     };
     session
         .request(
@@ -592,74 +1165,135 @@ pub async fn agent_status() -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-#[tauri::command]
-pub async fn send_agent_message(
-    app: AppHandle,
-    manager: State<'_, AgentManager>,
+pub(crate) fn design_context(
+    conn: &rusqlite::Connection,
     project_id: i64,
-    text: String,
-    context: String,
-) -> Result<(), String> {
-    let text = text.trim();
-    if text.is_empty() || text.len() > 20_000 || context.len() > 8_000 {
-        return Err("Invalid message length".into());
-    }
-    let conn = database(&app)?;
-    ensure_project(&conn, project_id)?;
-    let root: String = conn
+) -> Result<(String, i64), String> {
+    let (nodes_json, edges_json, revision, pending_draft): (
+        String,
+        String,
+        i64,
+        Option<(i64, i64, i64, String)>,
+    ) = conn
         .query_row(
-            "SELECT root FROM projects WHERE id = ?1",
+            "SELECT m.nodes, m.edges, m.revision, d.id, d.base_revision, d.version, d.draft
+             FROM project_maps m
+             LEFT JOIN design_drafts d ON d.id = (
+                 SELECT id FROM design_drafts
+                 WHERE project_id = m.project_id AND state = 'pending'
+                 ORDER BY version DESC LIMIT 1
+             )
+             WHERE m.project_id = ?1",
             [project_id],
-            |row| row.get(0),
+            |row| {
+                let draft_id: Option<i64> = row.get(3)?;
+                let draft = if let Some(id) = draft_id {
+                    Some((id, row.get(4)?, row.get(5)?, row.get(6)?))
+                } else {
+                    None
+                };
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, draft))
+            },
         )
         .map_err(|error| error.to_string())?;
-    let mut guard = manager.session.lock().await;
-    if guard.as_ref().is_some_and(|session| {
-        session.project_id != project_id || !session.alive.load(Ordering::Acquire)
-    }) {
-        if guard
-            .as_ref()
-            .is_some_and(|session| session.busy.load(Ordering::Acquire))
+    let draft = match pending_draft {
+        Some((id, base_revision, version, serialized)) => Some(json!({
+            "id": id,
+            "baseRevision": base_revision,
+            "version": version,
+            "current": base_revision == revision,
+            "draft": serde_json::from_str::<Value>(&serialized)
+                .map_err(|error| error.to_string())?,
+        })),
+        None => None,
+    };
+    let serialized = serde_json::to_string_pretty(&json!({
+        "mode": "design",
+        "confirmedMap": {
+            "revision": revision,
+            "nodes": serde_json::from_str::<Value>(&nodes_json).map_err(|error| error.to_string())?,
+            "edges": serde_json::from_str::<Value>(&edges_json).map_err(|error| error.to_string())?,
+        },
+        "pendingDraft": draft,
+        "rules": [
+            "The confirmed map is authoritative at the stated revision.",
+            "A pending draft is unconfirmed and must never be described as the confirmed map.",
+            "Do not use unsaved UI state; only the persisted map and draft above are available.",
+            "This is design-only context. Do not modify project files or perform implementation work.",
+        ],
+    }))
+    .map_err(|error| error.to_string())?;
+    Ok((serialized, revision))
+}
+
+fn optional_context_id(context: &str, pointer: &str) -> String {
+    serde_json::from_str::<Value>(context)
+        .ok()
+        .and_then(|value| value.pointer(pointer).and_then(Value::as_i64))
+        .map_or_else(|| "null".to_owned(), |value| value.to_string())
+}
+
+async fn request_design_turn(
+    app: &AppHandle,
+    manager: &AgentManager,
+    project_id: i64,
+    root: &str,
+    expected: ResponseExpectation,
+    prompt: &str,
+) -> Result<String, String> {
+    let (busy, response) = {
+        let mut guard = manager.session.lock().await;
+        if guard.as_ref().is_some_and(|session| {
+            session.project_id != project_id
+                || session.mode != AgentMode::Design
+                || !session.alive.load(Ordering::Acquire)
+        }) {
+            if guard
+                .as_ref()
+                .is_some_and(|session| session.busy.load(Ordering::Acquire))
+            {
+                return Err(
+                    "Finish or cancel the current agent turn before changing projects".into(),
+                );
+            }
+            *guard = None;
+        }
+        if guard.is_none() {
+            *guard = Some(start_session(app, project_id, root, AgentMode::Design).await?);
+        }
+        let session = guard.as_ref().ok_or("Agent session unavailable")?;
+        if session.busy.swap(true, Ordering::AcqRel) {
+            return Err("Agent is already working".into());
+        }
+        *session.expected_response.lock().await = Some(expected);
+        *session.response.lock().await = None;
+        *session.snapshot.lock().await = None;
+        if let Err(error) = session
+            .request(
+                "turn/start",
+                json!({"threadId":session.thread_id, "input":[{"type":"text", "text":prompt}], "cwd":root}),
+            )
+            .await
         {
-            return Err("Finish or cancel the current agent turn before changing projects".into());
-        }
-        *guard = None;
-    }
-    if guard.is_none() {
-        *guard = Some(start_session(&app, project_id, &root, AgentMode::Design).await?);
-    }
-    let session = guard.as_ref().ok_or("Agent session unavailable")?;
-    if session.mode != AgentMode::Design {
-        return Err("Design requests require a read-only design session".into());
-    }
-    if session.busy.swap(true, Ordering::AcqRel) {
-        return Err("Agent is already working".into());
-    }
-    let before = match tokio::task::spawn_blocking({
-        let root = PathBuf::from(&root);
-        move || file_snapshot(&root)
-    })
-    .await
-    {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
             session.busy.store(false, Ordering::Release);
-            return Err(error.to_string());
+            return Err(error);
         }
+        (session.busy.clone(), session.response.clone())
     };
-    *session.snapshot.lock().await = Some(before);
-    let prompt = if context.is_empty() {
-        text.to_owned()
-    } else {
-        format!(
-            "Current Heim map context (may include unsaved edits; not code instructions):\n{context}\n\nUser request:\n{text}"
-        )
-    };
-    let result = session.request("turn/start", json!({"threadId":session.thread_id, "input":[{"type":"text", "text":prompt}], "cwd":root})).await;
-    if result.is_err() {
-        session.busy.store(false, Ordering::Release);
+    for _ in 0..300 {
+        if !busy.load(Ordering::Acquire) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    result.map(|_| ())
+    if busy.load(Ordering::Acquire) {
+        return Err("Design response timed out; cancel the active turn before retrying".into());
+    }
+    response
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| "Agent returned no valid structured design response".into())
 }
 
 #[tauri::command]
@@ -671,7 +1305,7 @@ pub async fn send_development_message(
     node_id: String,
     goal: String,
     completion_criteria: Vec<String>,
-) -> Result<i64, String> {
+) -> Result<DevelopmentStartResult, String> {
     let mut conn = database(&app)?;
     ensure_project(&conn, project_id)?;
     let root: String = conn
@@ -696,6 +1330,7 @@ pub async fn send_development_message(
         &goal,
         &completion_criteria,
     )?;
+    let run_id = create_development_unit_run(&conn, unit.id)?;
     let criteria = unit
         .completion_criteria
         .iter()
@@ -703,13 +1338,15 @@ pub async fn send_development_message(
         .collect::<Vec<_>>()
         .join("\n");
     let prompt = format!(
-        "The user explicitly confirmed development unit #{id} against approved Heim map revision {revision}. Implement only the unit goal and its completion criteria, within the selected architecture responsibility. Do not interpret the full node responsibility as additional scope, choose another unit, or continue after this unit. Implement product behavior, not merely tests, fixtures, documentation, or a test harness. Tests may support verification after implementation. Before reporting, assess every completion criterion and state which are met or unmet. Respect the existing Codex workspace-write sandbox and approval policy.\n\nSelected architecture responsibility:\n{selected}\n\nDirectly related context (context only, not scope expansion):\n{related}\n\nConfirmed unit goal:\n{goal}\n\nCompletion criteria:\n{criteria}",
+        "HEIM MODE: DEVELOPMENT. Return exactly one JSON object as your final response, without markdown, using this contract: {{\"contractVersion\":1,\"mode\":\"development\",\"context\":{{\"mapRevision\":{revision},\"draftId\":null,\"draftVersion\":null,\"unitId\":{id}}},\"result\":{{\"kind\":\"development_report\",\"outcome\":\"completed\"|\"incomplete\"|\"blocked\",\"summary\":string,\"criteria\":[{{\"index\":number,\"status\":\"met\"|\"not_met\"|\"not_run\",\"evidence\":[string]}}],\"changes\":[{{\"path\":string,\"summary\":string}}],\"checks\":[{{\"command\":string,\"status\":\"passed\"|\"failed\"|\"not_run\",\"summary\":string}}],\"blockers\":[string]}}}}. Include exactly one criteria entry for each listed criterion, in the same order, using zero-based indexes. Report only checks actually run; your claims are not independent Heim verification. Contract version: 1. The user explicitly confirmed development unit #{id} against approved Heim map revision {revision}. This revision and unit are immutable for this turn. Implement only the unit goal and its completion criteria, within the selected architecture responsibility. Do not interpret the full node responsibility as additional scope, choose another unit, or continue after this unit. Implement product behavior, not merely tests, fixtures, documentation, or a test harness. Tests may support verification after implementation. Do not alter the confirmed map or mark any node implemented/verified based on your response. Respect the existing Codex workspace-write sandbox and approval policy.\n\nSelected architecture responsibility:\n{selected}\n\nDirectly related nodes (context only, not scope expansion):\n{related}\n\nDirect relationships, preserving source, target, and relation type (context only):\n{related_edges}\n\nConfirmed unit goal:\n{goal}\n\nCompletion criteria:\n{criteria}",
         id = unit.id,
         revision = unit.map_revision,
         selected =
             serde_json::to_string_pretty(&unit.selected_node).map_err(|error| error.to_string())?,
         related =
             serde_json::to_string_pretty(&unit.related_nodes).map_err(|error| error.to_string())?,
+        related_edges =
+            serde_json::to_string_pretty(&unit.related_edges).map_err(|error| error.to_string())?,
         goal = unit.goal,
     );
     *guard = None;
@@ -717,6 +1354,7 @@ pub async fn send_development_message(
         Ok(session) => session,
         Err(error) => {
             update_development_unit_status(&conn, unit.id, "start_failed", Some(&error))?;
+            transition_development_unit_run(&conn, run_id, "start_failed", Some(&error))?;
             return Err(error);
         }
     };
@@ -726,6 +1364,12 @@ pub async fn send_development_message(
         update_development_unit_status(
             &conn,
             unit.id,
+            "start_failed",
+            Some("Agent is already working"),
+        )?;
+        transition_development_unit_run(
+            &conn,
+            run_id,
             "start_failed",
             Some("Agent is already working"),
         )?;
@@ -746,24 +1390,50 @@ pub async fn send_development_message(
                 "start_failed",
                 Some(&error.to_string()),
             )?;
+            transition_development_unit_run(
+                &conn,
+                run_id,
+                "start_failed",
+                Some(&error.to_string()),
+            )?;
             return Err(error.to_string());
         }
     };
     *session.snapshot.lock().await = Some(before);
     if let Err(error) = update_development_unit_status(&conn, unit.id, "started", None) {
         session.busy.store(false, Ordering::Release);
+        transition_development_unit_run(&conn, run_id, "start_failed", Some(&error))?;
         return Err(error);
     }
+    *session.expected_response.lock().await = Some(ResponseExpectation {
+        mode: AgentMode::Development,
+        map_revision: unit.map_revision,
+        draft_id: None,
+        draft_version: None,
+        unit_id: Some(unit.id),
+        node_id: None,
+        criteria_count: unit.completion_criteria.len(),
+        result_kind: "development_report",
+    });
+    *session.response.lock().await = None;
+    session.active_run_id.store(run_id, Ordering::Release);
     let result = session.request(
         "turn/start",
         json!({"threadId":session.thread_id, "input":[{"type":"text", "text":prompt}], "cwd":root}),
     ).await;
     if let Err(error) = result {
         session.busy.store(false, Ordering::Release);
-        update_development_unit_status(&conn, unit.id, "start_failed", Some(&error))?;
+        let active_run_id = session.active_run_id.swap(0, Ordering::AcqRel);
+        if active_run_id > 0 {
+            transition_development_unit_run(&conn, run_id, "failed", Some(&error))?;
+        }
         return Err(error);
     }
-    Ok(unit.id)
+    transition_development_unit_run(&conn, run_id, "running", None)?;
+    Ok(DevelopmentStartResult {
+        unit_id: unit.id,
+        run_id,
+    })
 }
 
 pub(crate) async fn request_design_draft(
@@ -772,6 +1442,7 @@ pub(crate) async fn request_design_draft(
     project_id: i64,
     text: &str,
     latest_draft: Option<&str>,
+    expected_draft: Option<(i64, i64)>,
 ) -> Result<DesignResponse, String> {
     let text = text.trim();
     if text.is_empty() || text.len() > 20_000 {
@@ -786,74 +1457,218 @@ pub(crate) async fn request_design_draft(
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
-    let prompt = match latest_draft {
+    let (context, context_revision) = design_context(&conn, project_id)?;
+    let draft_instructions = match latest_draft {
         Some(draft) => format!(
-            "Revise the latest saved design draft only. Do not implement or create/edit files. Treat the saved draft below as the current user-edited source of truth; preserve stable IDs for unchanged nodes and apply the user's requested changes. Return exactly one JSON object without markdown using this schema: {{\"goal\":string,\"nodes\":[{{\"id\":string,\"title\":string,\"summary\":string explaining the node's responsibility and boundaries,\"responsibilities\":[string],\"type\":\"component\",\"status\":\"not_started\",\"questions\":[string]}}],\"edges\":[{{\"id\":string,\"source\":string,\"target\":string,\"relation\":\"depends_on\"|\"interacts_with\"}}],\"questions\":[string],\"assumptions\":[string]}}. For depends_on, source requires target; for interacts_with, source interacts with target. Never use an untyped or generic related edge. Put unresolved decisions next to the relevant node in its questions array; use the top-level questions array only for project-wide questions. Use unique stable IDs, valid edge endpoints, at least one responsibility per node, and status not_started for every node.\n\nUser change request:\n{text}\n\nLatest saved user-edited design draft:\n{draft}"
+            "Revise the latest saved design draft only. Do not implement or create/edit files. Treat the saved draft below as the current user-edited source of truth; preserve stable IDs for unchanged nodes and apply the user's requested changes. Put the map payload inside result.draft in the required versioned response envelope. Its schema is {{\"goal\":string,\"nodes\":[{{\"id\":string,\"title\":string,\"summary\":string explaining the node's responsibility and boundaries,\"responsibilities\":[string],\"type\":\"component\",\"status\":\"not_started\",\"questions\":[string]}}],\"edges\":[{{\"id\":string,\"source\":string,\"target\":string,\"relation\":\"depends_on\"|\"interacts_with\"}}],\"questions\":[string],\"assumptions\":[string]}}. For depends_on, source requires target; for interacts_with, source interacts with target. Never use an untyped or generic related edge. Put unresolved decisions next to the relevant node in its questions array; use the top-level questions array only for project-wide questions. Use unique stable IDs, valid edge endpoints, at least one responsibility per node, and status not_started for every node.\n\nUser change request:\n{text}\n\nLatest saved user-edited design draft:\n{draft}"
         ),
         None => format!(
-            "Design a logical architecture map only. Do not implement or create/edit files. Nodes are persistent system responsibilities, not files or one-off tasks. Return exactly one JSON object without markdown using this schema: {{\"goal\":string,\"nodes\":[{{\"id\":string,\"title\":string,\"summary\":string explaining the node's responsibility and boundaries,\"responsibilities\":[string],\"type\":\"component\",\"status\":\"not_started\",\"questions\":[string]}}],\"edges\":[{{\"id\":string,\"source\":string,\"target\":string,\"relation\":\"depends_on\"|\"interacts_with\"}}],\"questions\":[string],\"assumptions\":[string]}}. For depends_on, source requires target; for interacts_with, source interacts with target. Never use an untyped or generic related edge. Put unresolved decisions next to the relevant node in its questions array; use the top-level questions array only for project-wide questions. Use unique stable IDs, valid edge endpoints, at least one responsibility per node, and status not_started for every node.\n\nProduct description:\n{text}"
+            "Design a logical architecture map only. Do not implement or create/edit files. Nodes are persistent system responsibilities, not files or one-off tasks. Put the map payload inside result.draft in the required versioned response envelope. Its schema is {{\"goal\":string,\"nodes\":[{{\"id\":string,\"title\":string,\"summary\":string explaining the node's responsibility and boundaries,\"responsibilities\":[string],\"type\":\"component\",\"status\":\"not_started\",\"questions\":[string]}}],\"edges\":[{{\"id\":string,\"source\":string,\"target\":string,\"relation\":\"depends_on\"|\"interacts_with\"}}],\"questions\":[string],\"assumptions\":[string]}}. For depends_on, source requires target; for interacts_with, source interacts with target. Never use an untyped or generic related edge. Put unresolved decisions next to the relevant node in its questions array; use the top-level questions array only for project-wide questions. Use unique stable IDs, valid edge endpoints, at least one responsibility per node, and status not_started for every node.\n\nUser product description:\n{text}"
         ),
     };
-    let (busy, response) = {
-        let mut guard = manager.session.lock().await;
-        if guard.as_ref().is_some_and(|session| {
-            session.project_id != project_id
-                || session.mode != AgentMode::Design
-                || !session.alive.load(Ordering::Acquire)
-        }) {
-            if guard
-                .as_ref()
-                .is_some_and(|session| session.busy.load(Ordering::Acquire))
-            {
-                return Err(
-                    "Finish or cancel the current agent turn before changing projects".into(),
-                );
-            }
-            *guard = None;
-        }
-        if guard.is_none() {
-            *guard = Some(start_session(&app, project_id, &root, AgentMode::Design).await?);
-        }
-        let session = guard.as_ref().ok_or("Agent session unavailable")?;
-        if session.busy.swap(true, Ordering::AcqRel) {
-            return Err("Agent is already working".into());
-        }
-        *session.response.lock().await = None;
-        *session.snapshot.lock().await = None;
-        if let Err(error) = session
-            .request(
-                "turn/start",
-                json!({"threadId":session.thread_id, "input":[{"type":"text", "text":prompt}], "cwd":root}),
-            )
-            .await
-        {
-            session.busy.store(false, Ordering::Release);
-            return Err(error);
-        }
-        (session.busy.clone(), session.response.clone())
-    };
-    for _ in 0..300 {
-        if !busy.load(Ordering::Acquire) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    if busy.load(Ordering::Acquire) {
-        return Err("Design response timed out; cancel the active turn before retrying".into());
-    }
-    let text = response
-        .lock()
-        .await
-        .clone()
-        .ok_or("Agent returned no design response")?;
-    let revision: i64 = conn
+    let (draft_id, draft_version) =
+        expected_draft.map_or((None, None), |(id, version)| (Some(id), Some(version)));
+    let prompt = format!(
+        "Authoritative Heim context for this design turn:\n{context}\n\nReturn exactly one JSON object, no markdown, in this envelope: {{\"contractVersion\":1,\"mode\":\"design\",\"context\":{{\"mapRevision\":{context_revision},\"draftId\":{draft_id_json},\"draftVersion\":{draft_version_json},\"unitId\":null}},\"result\":{{\"kind\":\"map_draft\",\"message\":string,\"draft\":{{\"goal\":string,\"nodes\":[...],\"edges\":[...],\"questions\":[string],\"assumptions\":[string]}}}}}}. Echo these exact context identifiers. The draft is a proposal, not saved or approved.\n\n{draft_instructions}",
+        draft_id_json = draft_id.map_or("null".to_owned(), |id| id.to_string()),
+        draft_version_json = draft_version.map_or("null".to_owned(), |version| version.to_string()),
+    );
+    let text = request_design_turn(
+        &app,
+        manager,
+        project_id,
+        &root,
+        ResponseExpectation {
+            mode: AgentMode::Design,
+            map_revision: context_revision,
+            draft_id,
+            draft_version,
+            unit_id: None,
+            node_id: None,
+            criteria_count: 0,
+            result_kind: "map_draft",
+        },
+        &prompt,
+    )
+    .await?;
+    Ok(DesignResponse {
+        text,
+        revision: context_revision,
+    })
+}
+
+async fn request_development_unit_plan(
+    app: &AppHandle,
+    manager: &AgentManager,
+    project_id: i64,
+    map_revision: i64,
+    node_id: &str,
+    context: &Value,
+) -> Result<Value, String> {
+    let conn = database(app)?;
+    ensure_project(&conn, project_id)?;
+    let root: String = conn
         .query_row(
-            "SELECT revision FROM project_maps WHERE project_id = ?1",
+            "SELECT root FROM projects WHERE id = ?1",
             [project_id],
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
-    Ok(DesignResponse { text, revision })
+    let prompt = format!(
+        "HEIM MODE: UNIT PLANNING. This is read-only planning: do not edit files, run commands, or implement. For the selected confirmed architecture node, propose exactly one small, coherent, actionable first development unit, not the whole node responsibility. Completion criteria must be concrete, observable, and independently assessable. Include tests/verification only as criteria when the product behavior makes them relevant. Use direct neighbors and relationships only as context, never as scope expansion. Return exactly one JSON object without markdown: {{\"contractVersion\":1,\"mode\":\"design\",\"context\":{{\"mapRevision\":{map_revision},\"draftId\":null,\"draftVersion\":null,\"unitId\":null}},\"result\":{{\"kind\":\"unit_plan\",\"nodeId\":{node_id_json},\"goal\":string,\"completionCriteria\":[string]}}}}. Echo the exact node id and revision.\n\nAuthoritative node context:\n{context}",
+        node_id_json = serde_json::to_string(node_id).map_err(|error| error.to_string())?,
+        context = serde_json::to_string_pretty(context).map_err(|error| error.to_string())?,
+    );
+    let response = request_design_turn(
+        app,
+        manager,
+        project_id,
+        &root,
+        ResponseExpectation {
+            mode: AgentMode::Design,
+            map_revision,
+            draft_id: None,
+            draft_version: None,
+            unit_id: None,
+            node_id: Some(node_id.to_owned()),
+            criteria_count: 0,
+            result_kind: "unit_plan",
+        },
+        &prompt,
+    )
+    .await?;
+    let envelope: Value = serde_json::from_str(&response).map_err(|error| error.to_string())?;
+    envelope
+        .get("result")
+        .cloned()
+        .ok_or("AI unit plan response is missing result data".into())
+}
+
+#[tauri::command]
+pub async fn get_or_generate_development_unit_spec(
+    app: AppHandle,
+    manager: State<'_, AgentManager>,
+    project_id: i64,
+    map_revision: i64,
+    node_id: String,
+) -> Result<DevelopmentUnitSpec, String> {
+    let conn = database(&app)?;
+    ensure_project(&conn, project_id)?;
+    if !has_current_approved_map(&conn, project_id)? {
+        return Err("Approve the architecture map before generating a development plan".into());
+    }
+    let has_pending_draft: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM design_drafts WHERE project_id = ?1 AND state = 'pending')",
+            [project_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if has_pending_draft {
+        return Err("Resolve the pending design draft before generating a development plan".into());
+    }
+    let (nodes_json, edges_json, current_revision): (String, String, i64) = conn
+        .query_row(
+            "SELECT nodes, edges, revision FROM project_maps WHERE project_id = ?1",
+            [project_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    if current_revision != map_revision {
+        return Err("Map changed; reload before generating a development plan".into());
+    }
+    if let Some(spec) = load_development_unit_spec(&conn, project_id, map_revision, &node_id)? {
+        return Ok(spec);
+    }
+    let nodes: Vec<Value> = serde_json::from_str(&nodes_json).map_err(|error| error.to_string())?;
+    let edges: Vec<Value> = serde_json::from_str(&edges_json).map_err(|error| error.to_string())?;
+    let selected_node = nodes
+        .iter()
+        .find(|node| {
+            node.get("id").and_then(Value::as_str) == Some(node_id.as_str())
+                && node.get("type").and_then(Value::as_str) == Some("component")
+        })
+        .ok_or("Select a system responsibility from the confirmed map")?;
+    if node_has_unanswered_questions(selected_node) {
+        return Err(
+            "Answer the selected node's open questions before generating its development plan"
+                .into(),
+        );
+    }
+    let related_ids = edges
+        .iter()
+        .filter(|edge| {
+            edge.get("source").and_then(Value::as_str) == Some(node_id.as_str())
+                || edge.get("target").and_then(Value::as_str) == Some(node_id.as_str())
+        })
+        .flat_map(|edge| {
+            [
+                edge.get("source").and_then(Value::as_str),
+                edge.get("target").and_then(Value::as_str),
+            ]
+            .into_iter()
+            .flatten()
+        })
+        .filter(|related_id| *related_id != node_id)
+        .collect::<HashSet<_>>();
+    let related_nodes = nodes
+        .iter()
+        .filter(|node| {
+            node.get("type").and_then(Value::as_str) == Some("component")
+                && node
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| related_ids.contains(id))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let related_edges = edges
+        .iter()
+        .filter(|edge| {
+            edge.get("source").and_then(Value::as_str) == Some(node_id.as_str())
+                || edge.get("target").and_then(Value::as_str) == Some(node_id.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let context = json!({
+        "confirmedMapRevision": map_revision,
+        "selectedNode": selected_node,
+        "relatedNodes": related_nodes,
+        "relatedEdges": related_edges,
+        "scope": "Only the selected node's first development unit; relationships are context, not scope.",
+    });
+    drop(conn);
+    let result =
+        request_development_unit_plan(&app, &manager, project_id, map_revision, &node_id, &context)
+            .await?;
+    let goal = result["goal"]
+        .as_str()
+        .ok_or("AI unit plan goal is missing")?
+        .to_owned();
+    let completion_criteria = result["completionCriteria"]
+        .as_array()
+        .ok_or("AI unit plan criteria are missing")?
+        .iter()
+        .map(|criterion| {
+            criterion
+                .as_str()
+                .map(str::to_owned)
+                .ok_or("AI unit plan criteria must be strings")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_development_unit_spec(&goal, &completion_criteria)?;
+    let generated = DevelopmentUnitSpec {
+        project_id,
+        map_revision,
+        node_id,
+        goal,
+        completion_criteria,
+        source: "agent".into(),
+        version: 1,
+        updated_at: String::new(),
+    };
+    let mut conn = database(&app)?;
+    store_generated_development_unit_spec(&mut conn, &generated)
 }
 
 #[tauri::command]
@@ -862,10 +1677,9 @@ pub async fn send_design_message(
     manager: State<'_, AgentManager>,
     project_id: i64,
     text: String,
-    map_context: String,
 ) -> Result<(), String> {
     let text = text.trim();
-    if text.is_empty() || text.len() > 20_000 || map_context.len() > 200_000 {
+    if text.is_empty() || text.len() > 20_000 {
         return Err("Invalid design message".into());
     }
     let conn = database(&app)?;
@@ -877,8 +1691,11 @@ pub async fn send_design_message(
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
+    let (map_context, context_revision) = design_context(&conn, project_id)?;
     let prompt = format!(
-        "Discuss project design only. Do not create, edit, or delete files and do not run development work. Treat the confirmed Heim map below as context. Explain design implications or propose map changes in conversation; the user must explicitly save or approve map changes in Heim.\n\nConfirmed map:\n{map_context}\n\nUser design request:\n{text}"
+        "HEIM MODE: DESIGN. Discuss architecture, clarify questions, and propose changes only. This session is read-only; do not create, edit, or delete files, run commands, or begin implementation. The backend-provided context is authoritative: respect its confirmed-map revision, and treat any pending draft as unconfirmed. Never claim a proposal is persisted or approved. Clearly label any proposed changes as suggestions and ask the user to use Heim's draft review to save and approve them. Return exactly one JSON object without markdown: {{\"contractVersion\":1,\"mode\":\"design\",\"context\":{{\"mapRevision\":{context_revision},\"draftId\":{draft_id},\"draftVersion\":{draft_version},\"unitId\":null}},\"result\":{{\"kind\":\"discussion\",\"message\":string,\"questions\":[string],\"assumptions\":[string]}}}}. Echo the context identifiers exactly; do not include an unrequested map draft.\n\nAuthoritative persisted Heim context:\n{map_context}\n\nUser design request:\n{text}",
+        draft_id = optional_context_id(&map_context, "/pendingDraft/id"),
+        draft_version = optional_context_id(&map_context, "/pendingDraft/version"),
     );
     let mut guard = manager.session.lock().await;
     if guard
@@ -895,13 +1712,35 @@ pub async fn send_design_message(
     if session.busy.swap(true, Ordering::AcqRel) {
         return Err("Agent is already working".into());
     }
-    session
+    *session.expected_response.lock().await = Some(ResponseExpectation {
+        mode: AgentMode::Design,
+        map_revision: context_revision,
+        draft_id: serde_json::from_str::<Value>(&map_context)
+            .ok()
+            .and_then(|value| value.pointer("/pendingDraft/id").and_then(Value::as_i64)),
+        draft_version: serde_json::from_str::<Value>(&map_context)
+            .ok()
+            .and_then(|value| {
+                value
+                    .pointer("/pendingDraft/version")
+                    .and_then(Value::as_i64)
+            }),
+        unit_id: None,
+        node_id: None,
+        criteria_count: 0,
+        result_kind: "discussion",
+    });
+    *session.response.lock().await = None;
+    let result = session
         .request(
             "turn/start",
             json!({"threadId":session.thread_id,"input":[{"type":"text","text":prompt}],"cwd":root}),
         )
-        .await
-        .map(|_| ())
+        .await;
+    if result.is_err() {
+        session.busy.store(false, Ordering::Release);
+    }
+    result.map(|_| ())
 }
 
 #[tauri::command]
@@ -1001,5 +1840,137 @@ mod tests {
         assert!(AgentMode::Development.permits_approval("accept"));
         assert!(AgentMode::Development.permits_approval("decline"));
         assert!(!AgentMode::Development.permits_approval("other"));
+    }
+
+    #[test]
+    fn development_run_outcomes_do_not_treat_errors_as_success() {
+        assert_eq!(
+            terminal_development_run_state("completed", None),
+            ("finished", None)
+        );
+        assert_eq!(
+            terminal_development_run_state("completed", Some("provider error")),
+            ("failed", Some("provider error"))
+        );
+        assert_eq!(
+            terminal_development_run_state("interrupted", None),
+            ("interrupted", Some("interrupted"))
+        );
+        assert_eq!(
+            terminal_development_run_state("unknown", None),
+            ("failed", Some("unknown"))
+        );
+    }
+
+    #[test]
+    fn persistent_command_evidence_redacts_credential_like_arguments() {
+        assert_eq!(command_for_persistent_evidence("cargo test"), "cargo test");
+        assert_eq!(
+            command_for_persistent_evidence("tool --api-key=secret123 verify"),
+            "[redacted command containing a credential-like argument]"
+        );
+    }
+
+    #[test]
+    fn response_contract_rejects_wrong_versions_modes_and_unit_criteria() {
+        let expected = ResponseExpectation {
+            mode: AgentMode::Development,
+            map_revision: 7,
+            draft_id: None,
+            draft_version: None,
+            unit_id: Some(42),
+            node_id: None,
+            criteria_count: 2,
+            result_kind: "development_report",
+        };
+        let response = json!({
+            "contractVersion":1,
+            "mode":"development",
+            "context":{"mapRevision":7,"draftId":null,"draftVersion":null,"unitId":42},
+            "result":{
+                "kind":"development_report",
+                "outcome":"incomplete",
+                "summary":"One criterion is not verified.",
+                "criteria":[
+                    {"index":0,"status":"met","evidence":["Implemented behavior"]},
+                    {"index":1,"status":"not_run","evidence":["Test not run"]}
+                ],
+                "changes":[{"path":"src/lib.rs","summary":"Added behavior"}],
+                "checks":[{"command":"cargo test","status":"not_run","summary":"Not run"}],
+                "blockers":[]
+            }
+        })
+        .to_string();
+        let (result, summary) = validate_agent_response(&response, &expected).unwrap();
+        assert_eq!(result["outcome"], "incomplete");
+        assert!(summary.contains("One criterion is not verified."));
+        assert!(summary.contains("Criterion 1: not_run"));
+
+        let wrong_revision = response.replace("\"mapRevision\":7", "\"mapRevision\":6");
+        assert!(validate_agent_response(&wrong_revision, &expected).is_err());
+        let mut missing_criterion: Value = serde_json::from_str(&response).unwrap();
+        missing_criterion["result"]["criteria"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert!(validate_agent_response(&missing_criterion.to_string(), &expected).is_err());
+        let wrong_mode = response.replace("\"mode\":\"development\"", "\"mode\":\"design\"");
+        assert!(validate_agent_response(&wrong_mode, &expected).is_err());
+    }
+
+    #[test]
+    fn design_discussion_contract_requires_the_pinned_draft_identity() {
+        let expected = ResponseExpectation {
+            mode: AgentMode::Design,
+            map_revision: 3,
+            draft_id: Some(9),
+            draft_version: Some(2),
+            unit_id: None,
+            node_id: None,
+            criteria_count: 0,
+            result_kind: "discussion",
+        };
+        let response = json!({
+            "contractVersion":1,
+            "mode":"design",
+            "context":{"mapRevision":3,"draftId":9,"draftVersion":2,"unitId":null},
+            "result":{"kind":"discussion","message":"The draft keeps the approved map unchanged.","questions":[],"assumptions":[]}
+        }).to_string();
+        let (_, message) = validate_agent_response(&response, &expected).unwrap();
+        assert_eq!(message, "The draft keeps the approved map unchanged.");
+        let wrong_draft = response.replace("\"draftVersion\":2", "\"draftVersion\":1");
+        assert!(validate_agent_response(&wrong_draft, &expected).is_err());
+        let malformed = response.replace("\"questions\":[]", "\"questions\":\"none\"");
+        assert!(validate_agent_response(&malformed, &expected).is_err());
+    }
+
+    #[test]
+    fn unit_plan_contract_binds_goal_and_criteria_to_selected_node() {
+        let expected = ResponseExpectation {
+            mode: AgentMode::Design,
+            map_revision: 5,
+            draft_id: None,
+            draft_version: None,
+            unit_id: None,
+            node_id: Some("records".into()),
+            criteria_count: 0,
+            result_kind: "unit_plan",
+        };
+        let response = json!({
+            "contractVersion":1,
+            "mode":"design",
+            "context":{"mapRevision":5,"draftId":null,"draftVersion":null,"unitId":null},
+            "result":{"kind":"unit_plan","nodeId":"records","goal":"Persist a reading status change","completionCriteria":["A user can mark a book complete","The new status remains after reopening the project"]}
+        }).to_string();
+        let (result, _) = validate_agent_response(&response, &expected).unwrap();
+        assert_eq!(result["nodeId"], "records");
+        assert_eq!(result["completionCriteria"].as_array().unwrap().len(), 2);
+        let wrong_node = response.replace("records", "storage");
+        assert!(validate_agent_response(&wrong_node, &expected).is_err());
+        let too_many_criteria = response.replace(
+            "[\"A user can mark a book complete\",\"The new status remains after reopening the project\"]",
+            "[]",
+        );
+        assert!(validate_agent_response(&too_many_criteria, &expected).is_err());
     }
 }

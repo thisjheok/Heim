@@ -90,6 +90,51 @@ const SCHEMA: &str = "
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         started_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS development_unit_runs (
+        id INTEGER PRIMARY KEY,
+        unit_id INTEGER NOT NULL REFERENCES development_units(id) ON DELETE CASCADE,
+        state TEXT NOT NULL CHECK(state IN (
+            'starting', 'running', 'finished', 'interrupted', 'failed', 'disconnected', 'start_failed'
+        )),
+        detail TEXT,
+        started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        finished_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS development_unit_specs (
+        project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        map_revision INTEGER NOT NULL,
+        node_id TEXT NOT NULL,
+        goal TEXT NOT NULL,
+        completion_criteria TEXT NOT NULL,
+        source TEXT NOT NULL CHECK(source IN ('agent', 'user')),
+        version INTEGER NOT NULL DEFAULT 1,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY(project_id, map_revision, node_id)
+    );
+    CREATE TABLE IF NOT EXISTS development_unit_run_reports (
+        run_id INTEGER PRIMARY KEY REFERENCES development_unit_runs(id) ON DELETE CASCADE,
+        outcome TEXT NOT NULL CHECK(outcome IN ('completed', 'incomplete', 'blocked')),
+        summary TEXT NOT NULL,
+        report TEXT NOT NULL,
+        saved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS development_unit_run_evidence (
+        id INTEGER PRIMARY KEY,
+        run_id INTEGER NOT NULL REFERENCES development_unit_runs(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK(kind IN ('command_execution', 'workspace_snapshot')),
+        evidence TEXT NOT NULL,
+        observed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS development_unit_reviews (
+        id INTEGER PRIMARY KEY,
+        unit_id INTEGER NOT NULL REFERENCES development_units(id) ON DELETE CASCADE,
+        run_id INTEGER NOT NULL REFERENCES development_unit_runs(id) ON DELETE CASCADE,
+        decision TEXT NOT NULL CHECK(decision IN (
+            'approved_completion', 'rework_requested', 'blocked', 'incomplete'
+        )),
+        note TEXT,
+        reviewed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
 ";
 
 fn database(app: &tauri::AppHandle) -> Result<Connection, String> {
@@ -550,12 +595,35 @@ fn edge_handles(source: &Value, target: &Value) -> (&'static str, &'static str) 
     }
 }
 
-fn parse_design_response(response: &str) -> Result<DesignDraft, String> {
+fn parse_design_response(
+    response: &str,
+    expected_revision: i64,
+    expected_draft_id: Option<i64>,
+    expected_draft_version: Option<i64>,
+) -> Result<DesignDraft, String> {
     if response.len() > 200_000 {
         return Err("Agent design response is too large".into());
     }
-    let value: Value = serde_json::from_str(response.trim())
+    let envelope: Value = serde_json::from_str(response.trim())
         .map_err(|error| format!("Agent response was not JSON: {error}"))?;
+    let context = &envelope["context"];
+    if envelope["contractVersion"] != 1
+        || envelope["mode"] != "design"
+        || context["mapRevision"].as_i64() != Some(expected_revision)
+        || context["draftId"].as_i64() != expected_draft_id
+        || context["draftVersion"].as_i64() != expected_draft_version
+        || !context["unitId"].is_null()
+        || envelope.pointer("/result/kind").and_then(Value::as_str) != Some("map_draft")
+        || envelope
+            .pointer("/result/message")
+            .and_then(Value::as_str)
+            .map_or(true, |message| message.trim().is_empty())
+    {
+        return Err("Agent design response does not match the versioned map-draft contract".into());
+    }
+    let value = envelope
+        .pointer("/result/draft")
+        .ok_or("Structured map draft payload is missing")?;
     let goal = value
         .get("goal")
         .and_then(Value::as_str)
@@ -695,8 +763,9 @@ async fn create_design_draft(
         return Err("A design draft is already pending review".into());
     }
     let response =
-        agent::request_design_draft(app.clone(), &manager, project_id, &description, None).await?;
-    let draft = parse_design_response(&response.text)?;
+        agent::request_design_draft(app.clone(), &manager, project_id, &description, None, None)
+            .await?;
+    let draft = parse_design_response(&response.text, response.revision, None, None)?;
     let current_revision: i64 = conn
         .query_row(
             "SELECT revision FROM project_maps WHERE project_id = ?1",
@@ -753,6 +822,77 @@ fn development_ready(app: tauri::AppHandle, project_id: i64) -> Result<bool, Str
     has_current_approved_map(&conn, project_id)
 }
 
+#[tauri::command]
+fn save_development_unit_spec(
+    app: tauri::AppHandle,
+    project_id: i64,
+    map_revision: i64,
+    node_id: String,
+    expected_version: i64,
+    goal: String,
+    completion_criteria: Vec<String>,
+) -> Result<DevelopmentUnitSpec, String> {
+    validate_development_unit_spec(&goal, &completion_criteria)?;
+    let conn = database(&app)?;
+    ensure_project(&conn, project_id)?;
+    let (nodes_json, revision): (String, i64) = conn
+        .query_row(
+            "SELECT nodes, revision FROM project_maps WHERE project_id = ?1",
+            [project_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    if revision != map_revision || !has_current_approved_map(&conn, project_id)? {
+        return Err("Approved map changed; reload the node plan before saving".into());
+    }
+    let has_pending_draft: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM design_drafts WHERE project_id = ?1 AND state = 'pending')",
+            [project_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if has_pending_draft {
+        return Err("Resolve the pending design draft before editing a development plan".into());
+    }
+    let nodes: Vec<Value> = serde_json::from_str(&nodes_json).map_err(|error| error.to_string())?;
+    let node = nodes
+        .iter()
+        .find(|node| {
+            node.get("id").and_then(Value::as_str) == Some(node_id.as_str())
+                && node.get("type").and_then(Value::as_str) == Some("component")
+        })
+        .ok_or("Selected responsibility is not in the confirmed map")?;
+    if node_has_unanswered_questions(node) {
+        return Err(
+            "Answer the selected node's open questions before editing its development plan".into(),
+        );
+    }
+    let serialized =
+        serde_json::to_string(&completion_criteria).map_err(|error| error.to_string())?;
+    let updated = conn
+        .execute(
+            "UPDATE development_unit_specs
+             SET goal = ?1, completion_criteria = ?2, source = 'user',
+                 version = version + 1, updated_at = CURRENT_TIMESTAMP
+             WHERE project_id = ?3 AND map_revision = ?4 AND node_id = ?5 AND version = ?6",
+            rusqlite::params![
+                goal.trim(),
+                serialized,
+                project_id,
+                map_revision,
+                node_id,
+                expected_version
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if updated != 1 {
+        return Err("Development plan changed; reload it before saving edits".into());
+    }
+    load_development_unit_spec(&conn, project_id, map_revision, &node_id)?
+        .ok_or_else(|| "Saved development plan is unavailable".to_owned())
+}
+
 pub(crate) fn has_current_approved_map(conn: &Connection, project_id: i64) -> Result<bool, String> {
     conn.query_row(
         "SELECT EXISTS(
@@ -775,9 +915,126 @@ pub(crate) struct DevelopmentUnit {
     pub completion_criteria: Vec<String>,
     pub selected_node: Value,
     pub related_nodes: Vec<Value>,
+    pub related_edges: Vec<Value>,
 }
 
-fn node_has_unanswered_questions(node: &Value) -> bool {
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DevelopmentUnitSpec {
+    pub project_id: i64,
+    pub map_revision: i64,
+    pub node_id: String,
+    pub goal: String,
+    pub completion_criteria: Vec<String>,
+    pub source: String,
+    pub version: i64,
+    pub updated_at: String,
+}
+
+pub(crate) fn validate_development_unit_spec(
+    goal: &str,
+    criteria: &[String],
+) -> Result<(), String> {
+    if goal.trim().is_empty() || goal.trim().len() > 4_000 {
+        return Err("Unit goal must contain 1-4000 characters".into());
+    }
+    if criteria.is_empty()
+        || criteria.len() > 20
+        || criteria
+            .iter()
+            .any(|criterion| criterion.trim().is_empty() || criterion.len() > 1_000)
+    {
+        return Err("Provide 1-20 completion criteria, each containing 1-1000 characters".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn load_development_unit_spec(
+    conn: &Connection,
+    project_id: i64,
+    map_revision: i64,
+    node_id: &str,
+) -> Result<Option<DevelopmentUnitSpec>, String> {
+    conn.query_row(
+        "SELECT goal, completion_criteria, source, version, updated_at
+         FROM development_unit_specs WHERE project_id = ?1 AND map_revision = ?2 AND node_id = ?3",
+        rusqlite::params![project_id, map_revision, node_id],
+        |row| {
+            let criteria: String = row.get(1)?;
+            Ok(DevelopmentUnitSpec {
+                project_id,
+                map_revision,
+                node_id: node_id.to_owned(),
+                goal: row.get(0)?,
+                completion_criteria: serde_json::from_str(&criteria).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                source: row.get(2)?,
+                version: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|error| error.to_string())
+}
+
+pub(crate) fn store_generated_development_unit_spec(
+    conn: &mut Connection,
+    spec: &DevelopmentUnitSpec,
+) -> Result<DevelopmentUnitSpec, String> {
+    validate_development_unit_spec(&spec.goal, &spec.completion_criteria)?;
+    let criteria =
+        serde_json::to_string(&spec.completion_criteria).map_err(|error| error.to_string())?;
+    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    let current_revision: i64 = tx
+        .query_row(
+            "SELECT revision FROM project_maps WHERE project_id = ?1",
+            [spec.project_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if current_revision != spec.map_revision || !has_current_approved_map(&tx, spec.project_id)? {
+        return Err(
+            "Approved map changed while generating the unit plan; select the node again".into(),
+        );
+    }
+    let pending: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM design_drafts WHERE project_id = ?1 AND state = 'pending')",
+            [spec.project_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if pending {
+        return Err("Resolve the pending design draft before generating a development plan".into());
+    }
+    tx.execute(
+        "INSERT INTO development_unit_specs
+            (project_id, map_revision, node_id, goal, completion_criteria, source)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'agent')
+         ON CONFLICT(project_id, map_revision, node_id) DO NOTHING",
+        rusqlite::params![
+            spec.project_id,
+            spec.map_revision,
+            spec.node_id,
+            spec.goal.trim(),
+            criteria
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    let stored =
+        load_development_unit_spec(&tx, spec.project_id, spec.map_revision, &spec.node_id)?
+            .ok_or("Generated unit plan was not stored")?;
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(stored)
+}
+
+pub(crate) fn node_has_unanswered_questions(node: &Value) -> bool {
     let Some(questions) = node.pointer("/data/questions").and_then(Value::as_array) else {
         return false;
     };
@@ -867,6 +1124,14 @@ pub(crate) fn record_development_unit(
         })
         .cloned()
         .collect::<Vec<_>>();
+    let related_edges = edges
+        .iter()
+        .filter(|edge| {
+            edge.get("source").and_then(Value::as_str) == Some(node_id)
+                || edge.get("target").and_then(Value::as_str) == Some(node_id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let completion_criteria = completion_criteria
         .iter()
         .map(|criterion| criterion.trim().to_owned())
@@ -888,6 +1153,7 @@ pub(crate) fn record_development_unit(
         completion_criteria,
         selected_node: selected_node.clone(),
         related_nodes,
+        related_edges,
     };
     tx.commit().map_err(|error| error.to_string())?;
     Ok(unit)
@@ -918,6 +1184,207 @@ pub(crate) fn update_development_unit_status(
     Ok(())
 }
 
+pub(crate) fn create_development_unit_run(conn: &Connection, unit_id: i64) -> Result<i64, String> {
+    conn.execute(
+        "INSERT INTO development_unit_runs (unit_id, state) VALUES (?1, 'starting')",
+        [unit_id],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub(crate) fn transition_development_unit_run(
+    conn: &Connection,
+    run_id: i64,
+    state: &str,
+    detail: Option<&str>,
+) -> Result<bool, String> {
+    if !matches!(
+        state,
+        "running" | "finished" | "interrupted" | "failed" | "disconnected" | "start_failed"
+    ) {
+        return Err("Invalid development-run state".into());
+    }
+    let detail = detail.map(|value| value.chars().take(1_000).collect::<String>());
+    let updated = if state == "running" {
+        conn.execute(
+            "UPDATE development_unit_runs SET state = 'running', detail = NULL
+             WHERE id = ?1 AND state IN ('starting', 'running')",
+            [run_id],
+        )
+    } else {
+        conn.execute(
+            "UPDATE development_unit_runs
+             SET state = ?2, detail = ?3, finished_at = CURRENT_TIMESTAMP
+             WHERE id = ?1 AND state IN ('starting', 'running')",
+            rusqlite::params![run_id, state, detail.as_deref()],
+        )
+    }
+    .map_err(|error| error.to_string())?;
+    Ok(updated == 1)
+}
+
+pub(crate) fn save_development_unit_run_report(
+    conn: &mut Connection,
+    run_id: i64,
+    report: &Value,
+) -> Result<(), String> {
+    let outcome = report
+        .get("outcome")
+        .and_then(Value::as_str)
+        .filter(|outcome| matches!(*outcome, "completed" | "incomplete" | "blocked"))
+        .ok_or("Invalid development report outcome")?;
+    let summary = report
+        .get("summary")
+        .and_then(Value::as_str)
+        .filter(|summary| !summary.trim().is_empty())
+        .ok_or("Development report summary is missing")?;
+    let serialized = serde_json::to_string(report).map_err(|error| error.to_string())?;
+    if serialized.len() > 200_000 {
+        return Err("Development report exceeds the 200000-byte storage limit".into());
+    }
+    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    let stored_criteria_json: Option<String> = tx
+        .query_row(
+            "SELECT u.completion_criteria FROM development_unit_runs r
+             JOIN development_units u ON u.id = r.unit_id
+             WHERE r.id = ?1 AND r.state IN ('starting', 'running')",
+            [run_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some(stored_criteria_json) = stored_criteria_json else {
+        return Err("Development report does not match an active run".into());
+    };
+    let stored_criteria: Vec<String> =
+        serde_json::from_str(&stored_criteria_json).map_err(|error| error.to_string())?;
+    let report_criteria = report
+        .get("criteria")
+        .and_then(Value::as_array)
+        .ok_or("Development report completion criteria are missing")?;
+    if report_criteria.len() != stored_criteria.len()
+        || report_criteria
+            .iter()
+            .enumerate()
+            .any(|(index, criterion)| {
+                criterion.get("index").and_then(Value::as_u64) != Some(index as u64)
+            })
+    {
+        return Err("Development report criteria do not match the confirmed unit".into());
+    }
+    tx.execute(
+        "INSERT INTO development_unit_run_reports (run_id, outcome, summary, report)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(run_id) DO UPDATE SET outcome = excluded.outcome,
+             summary = excluded.summary, report = excluded.report, saved_at = CURRENT_TIMESTAMP",
+        rusqlite::params![run_id, outcome, summary, serialized],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())
+}
+
+pub(crate) fn record_development_unit_run_evidence(
+    conn: &Connection,
+    run_id: i64,
+    kind: &str,
+    evidence: &Value,
+) -> Result<(), String> {
+    if !matches!(kind, "command_execution" | "workspace_snapshot") {
+        return Err("Invalid development-run evidence kind".into());
+    }
+    let serialized = serde_json::to_string(evidence).map_err(|error| error.to_string())?;
+    if serialized.len() > 200_000 {
+        return Err("Development-run evidence exceeds the 200000-byte storage limit".into());
+    }
+    let inserted = conn
+        .execute(
+            "INSERT INTO development_unit_run_evidence (run_id, kind, evidence)
+         SELECT ?1, ?2, ?3 WHERE EXISTS (
+             SELECT 1 FROM development_unit_runs WHERE id = ?1
+         )",
+            rusqlite::params![run_id, kind, serialized],
+        )
+        .map_err(|error| error.to_string())?;
+    if inserted != 1 {
+        return Err("Development-run evidence references an unknown run".into());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredDevelopmentUnitReviewDecision {
+    id: i64,
+    unit_id: i64,
+    run_id: i64,
+    decision: String,
+    note: Option<String>,
+    reviewed_at: String,
+}
+
+fn save_development_unit_review_in_db(
+    conn: &mut Connection,
+    project_id: i64,
+    unit_id: i64,
+    run_id: i64,
+    decision: &str,
+    note: Option<&str>,
+) -> Result<StoredDevelopmentUnitReviewDecision, String> {
+    if !matches!(
+        decision,
+        "approved_completion" | "rework_requested" | "blocked" | "incomplete"
+    ) {
+        return Err("Invalid development review decision".into());
+    }
+    let note = note.map(str::trim).filter(|note| !note.is_empty());
+    if note.is_some_and(|note| note.chars().count() > 2_000) {
+        return Err("Review note must be at most 2000 characters".into());
+    }
+
+    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    ensure_project(&tx, project_id)?;
+    let run_state = tx
+        .query_row(
+            "SELECT r.state FROM development_unit_runs r
+             JOIN development_units u ON u.id = r.unit_id
+             WHERE r.id = ?1 AND u.id = ?2 AND u.project_id = ?3
+               AND r.id = (
+                   SELECT id FROM development_unit_runs WHERE unit_id = u.id ORDER BY id DESC LIMIT 1
+               )",
+            rusqlite::params![run_id, unit_id, project_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or("Review must reference the selected unit's latest run")?;
+    if matches!(run_state.as_str(), "starting" | "running") {
+        return Err("Wait for the Agent run to finish before reviewing it".into());
+    }
+    tx.execute(
+        "INSERT INTO development_unit_reviews (unit_id, run_id, decision, note)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![unit_id, run_id, decision, note],
+    )
+    .map_err(|error| error.to_string())?;
+    let review = StoredDevelopmentUnitReviewDecision {
+        id: tx.last_insert_rowid(),
+        unit_id,
+        run_id,
+        decision: decision.to_owned(),
+        note: note.map(str::to_owned),
+        reviewed_at: tx
+            .query_row(
+                "SELECT reviewed_at FROM development_unit_reviews WHERE id = ?1",
+                [tx.last_insert_rowid()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?,
+    };
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(review)
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredDevelopmentUnit {
@@ -931,6 +1398,14 @@ struct StoredDevelopmentUnit {
     status_detail: Option<String>,
     created_at: String,
     started_at: Option<String>,
+    latest_run_id: Option<i64>,
+    latest_run_state: Option<String>,
+    latest_run_detail: Option<String>,
+    latest_run_started_at: Option<String>,
+    latest_run_finished_at: Option<String>,
+    review_decision: Option<String>,
+    review_note: Option<String>,
+    reviewed_at: Option<String>,
 }
 
 #[tauri::command]
@@ -939,12 +1414,28 @@ fn project_development_units(
     project_id: i64,
 ) -> Result<Vec<StoredDevelopmentUnit>, String> {
     let conn = database(&app)?;
+    project_development_units_in_db(&conn, project_id)
+}
+
+fn project_development_units_in_db(
+    conn: &Connection,
+    project_id: i64,
+) -> Result<Vec<StoredDevelopmentUnit>, String> {
     ensure_project(&conn, project_id)?;
     let mut statement = conn
         .prepare(
-            "SELECT id, map_revision, node_id, goal, completion_criteria, status,
-                    status_detail, created_at, started_at
-             FROM development_units WHERE project_id = ?1 ORDER BY id DESC",
+            "SELECT u.id, u.map_revision, u.node_id, u.goal, u.completion_criteria, u.status,
+                    u.status_detail, u.created_at, u.started_at,
+                    r.id, r.state, r.detail, r.started_at, r.finished_at,
+                    v.decision, v.note, v.reviewed_at
+             FROM development_units u
+             LEFT JOIN development_unit_runs r ON r.id = (
+                 SELECT id FROM development_unit_runs WHERE unit_id = u.id ORDER BY id DESC LIMIT 1
+             )
+             LEFT JOIN development_unit_reviews v ON v.id = (
+                 SELECT id FROM development_unit_reviews WHERE run_id = r.id ORDER BY id DESC LIMIT 1
+             )
+             WHERE u.project_id = ?1 ORDER BY u.id DESC",
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
@@ -959,6 +1450,14 @@ fn project_development_units(
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, String>(7)?,
                 row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, Option<String>>(14)?,
+                row.get::<_, Option<String>>(15)?,
+                row.get::<_, Option<String>>(16)?,
             ))
         })
         .map_err(|error| error.to_string())?;
@@ -973,6 +1472,14 @@ fn project_development_units(
             status_detail,
             created_at,
             started_at,
+            latest_run_id,
+            latest_run_state,
+            latest_run_detail,
+            latest_run_started_at,
+            latest_run_finished_at,
+            review_decision,
+            review_note,
+            reviewed_at,
         ) = row.map_err(|error| error.to_string())?;
         Ok(StoredDevelopmentUnit {
             id,
@@ -986,9 +1493,142 @@ fn project_development_units(
             status_detail,
             created_at,
             started_at,
+            latest_run_id,
+            latest_run_state,
+            latest_run_detail,
+            latest_run_started_at,
+            latest_run_finished_at,
+            review_decision,
+            review_note,
+            reviewed_at,
         })
     })
     .collect()
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DevelopmentRunEvidence {
+    id: i64,
+    kind: String,
+    evidence: Value,
+    observed_at: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DevelopmentRunReview {
+    run_id: i64,
+    unit_id: i64,
+    state: String,
+    detail: Option<String>,
+    started_at: String,
+    finished_at: Option<String>,
+    report: Option<Value>,
+    evidence: Vec<DevelopmentRunEvidence>,
+}
+
+fn development_unit_run_review_in_db(
+    conn: &Connection,
+    project_id: i64,
+    run_id: i64,
+) -> Result<DevelopmentRunReview, String> {
+    ensure_project(conn, project_id)?;
+    let (unit_id, state, detail, started_at, finished_at, report_json): (
+        i64,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+    ) = conn
+        .query_row(
+            "SELECT r.unit_id, r.state, r.detail, r.started_at, r.finished_at, p.report
+             FROM development_unit_runs r
+             JOIN development_units u ON u.id = r.unit_id
+             LEFT JOIN development_unit_run_reports p ON p.run_id = r.id
+             WHERE r.id = ?1 AND u.project_id = ?2",
+            rusqlite::params![run_id, project_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let report = report_json
+        .map(|report| serde_json::from_str(&report).map_err(|error| error.to_string()))
+        .transpose()?;
+    let mut statement = conn
+        .prepare(
+            "SELECT id, kind, evidence, observed_at FROM development_unit_run_evidence
+             WHERE run_id = ?1 ORDER BY id",
+        )
+        .map_err(|error| error.to_string())?;
+    let evidence = statement
+        .query_map([run_id], |row| {
+            let serialized: String = row.get(2)?;
+            Ok(DevelopmentRunEvidence {
+                id: row.get(0)?,
+                kind: row.get(1)?,
+                evidence: serde_json::from_str(&serialized).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                observed_at: row.get(3)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .map(|row| row.map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(DevelopmentRunReview {
+        run_id,
+        unit_id,
+        state,
+        detail,
+        started_at,
+        finished_at,
+        report,
+        evidence,
+    })
+}
+
+#[tauri::command]
+fn development_unit_run_review(
+    app: tauri::AppHandle,
+    project_id: i64,
+    run_id: i64,
+) -> Result<DevelopmentRunReview, String> {
+    let conn = database(&app)?;
+    development_unit_run_review_in_db(&conn, project_id, run_id)
+}
+
+#[tauri::command]
+fn save_development_unit_review(
+    app: tauri::AppHandle,
+    project_id: i64,
+    unit_id: i64,
+    run_id: i64,
+    decision: String,
+    note: Option<String>,
+) -> Result<StoredDevelopmentUnitReviewDecision, String> {
+    let mut conn = database(&app)?;
+    save_development_unit_review_in_db(
+        &mut conn,
+        project_id,
+        unit_id,
+        run_id,
+        &decision,
+        note.as_deref(),
+    )
 }
 
 #[tauri::command]
@@ -1125,12 +1765,18 @@ async fn revise_design_draft(
         project_id,
         request,
         Some(&latest_json),
+        Some((draft_id, expected_version)),
     )
     .await?;
     if response.revision != base_revision {
         return Err("Confirmed map changed while the revision was being generated".into());
     }
-    let revised = parse_design_response(&response.text)?;
+    let revised = parse_design_response(
+        &response.text,
+        base_revision,
+        Some(draft_id),
+        Some(expected_version),
+    )?;
     persist_agent_revision(
         &conn,
         project_id,
@@ -1240,13 +1886,16 @@ pub fn run() {
             create_design_draft,
             pending_design_draft,
             development_ready,
+            save_development_unit_spec,
             project_development_units,
+            development_unit_run_review,
+            save_development_unit_review,
             update_design_draft,
             resolve_design_draft,
             revise_design_draft,
             agent::agent_status,
-            agent::send_agent_message,
             agent::send_design_message,
+            agent::get_or_generate_development_unit_spec,
             agent::send_development_message,
             agent::cancel_agent_turn,
             agent::answer_agent_approval,
@@ -1435,6 +2084,8 @@ mod tests {
             .unwrap();
 
         let mut map = sample_map();
+        map.nodes.push(json!({"id":"storage","type":"component","position":{"x":10,"y":0},"data":{"title":"Storage","summary":"Persists records","responsibilities":["Persist records"],"status":"Not started"}}));
+        map.edges.push(json!({"id":"a-storage","source":"a","target":"storage","data":{"relation":"depends_on"}}));
         assert_eq!(save_map(&conn, 1, &map).unwrap(), 1);
         let criteria = vec![
             "A record can be created".into(),
@@ -1457,6 +2108,37 @@ mod tests {
         )
         .unwrap();
 
+        let generated_spec = DevelopmentUnitSpec {
+            project_id: 1,
+            map_revision: 1,
+            node_id: "a".into(),
+            goal: "Create a persistent reading record".into(),
+            completion_criteria: criteria.clone(),
+            source: "agent".into(),
+            version: 1,
+            updated_at: String::new(),
+        };
+        let stored_spec =
+            store_generated_development_unit_spec(&mut conn, &generated_spec).unwrap();
+        assert_eq!(stored_spec.source, "agent");
+        assert_eq!(stored_spec.version, 1);
+        let conflicting_generation = DevelopmentUnitSpec {
+            goal: "Must not overwrite a saved or edited plan".into(),
+            ..generated_spec.clone()
+        };
+        assert_eq!(
+            store_generated_development_unit_spec(&mut conn, &conflicting_generation)
+                .unwrap()
+                .goal,
+            generated_spec.goal
+        );
+        assert!(
+            load_development_unit_spec(&conn, 1, 2, "a")
+                .unwrap()
+                .is_none()
+        );
+        assert!(validate_development_unit_spec("", &criteria).is_err());
+
         let unit = record_development_unit(
             &mut conn,
             1,
@@ -1469,6 +2151,11 @@ mod tests {
         assert_eq!(unit.map_revision, 1);
         assert_eq!(unit.selected_node["id"], "a");
         assert_eq!(unit.completion_criteria, criteria);
+        assert_eq!(unit.related_nodes.len(), 1);
+        assert_eq!(unit.related_nodes[0]["id"], "storage");
+        assert_eq!(unit.related_edges[0]["source"], "a");
+        assert_eq!(unit.related_edges[0]["target"], "storage");
+        assert_eq!(unit.related_edges[0]["data"]["relation"], "depends_on");
         let (status, stored_goal, stored_criteria): (String, String, String) = conn
             .query_row(
                 "SELECT status, goal, completion_criteria FROM development_units WHERE id = ?1",
@@ -1488,6 +2175,228 @@ mod tests {
                 .is_ok()
         );
 
+        let finished_run_id = create_development_unit_run(&conn, unit.id).unwrap();
+        assert!(transition_development_unit_run(&conn, finished_run_id, "running", None).unwrap());
+        assert!(transition_development_unit_run(&conn, finished_run_id, "finished", None).unwrap());
+        assert!(
+            !transition_development_unit_run(
+                &conn,
+                finished_run_id,
+                "disconnected",
+                Some("Late disconnect")
+            )
+            .unwrap()
+        );
+        let (run_unit_id, run_state, finished_at): (i64, String, Option<String>) = conn
+            .query_row(
+                "SELECT unit_id, state, finished_at FROM development_unit_runs WHERE id = ?1",
+                [finished_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(run_unit_id, unit.id);
+        assert_eq!(run_state, "finished");
+        assert!(finished_at.is_some());
+        let report_run_id = create_development_unit_run(&conn, unit.id).unwrap();
+        assert!(transition_development_unit_run(&conn, report_run_id, "running", None).unwrap());
+        let report = json!({
+            "kind":"development_report",
+            "outcome":"incomplete",
+            "summary":"One check was not run.",
+            "criteria":[
+                {"index":0,"status":"met","evidence":["Agent report"]},
+                {"index":1,"status":"not_run","evidence":["No test evidence"]}
+            ],
+            "changes":[{"path":"src/lib.rs","summary":"Added persistence"}],
+            "checks":[{"command":"cargo test","status":"not_run","summary":"Not run"}],
+            "blockers":[]
+        });
+        save_development_unit_run_report(&mut conn, report_run_id, &report).unwrap();
+        record_development_unit_run_evidence(
+            &conn,
+            report_run_id,
+            "command_execution",
+            &json!({"command":"cargo test","status":"completed","exitCode":0}),
+        )
+        .unwrap();
+        record_development_unit_run_evidence(
+            &conn,
+            report_run_id,
+            "workspace_snapshot",
+            &json!({"available":true,"changedFiles":["src/lib.rs"]}),
+        )
+        .unwrap();
+        let (report_outcome, report_json): (String, String) = conn
+            .query_row(
+                "SELECT outcome, report FROM development_unit_run_reports WHERE run_id = ?1",
+                [report_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(report_outcome, "incomplete");
+        assert_eq!(serde_json::from_str::<Value>(&report_json).unwrap(), report);
+        let evidence_kinds: Vec<String> = conn
+            .prepare(
+                "SELECT kind FROM development_unit_run_evidence WHERE run_id = ?1 ORDER BY kind",
+            )
+            .unwrap()
+            .query_map([report_run_id], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            evidence_kinds,
+            vec!["command_execution", "workspace_snapshot"]
+        );
+        let review = development_unit_run_review_in_db(&conn, 1, report_run_id).unwrap();
+        assert_eq!(review.unit_id, unit.id);
+        assert_eq!(review.report.as_ref().unwrap()["outcome"], "incomplete");
+        assert_eq!(review.evidence.len(), 2);
+        assert!(development_unit_run_review_in_db(&conn, 2, report_run_id).is_err());
+        assert!(
+            save_development_unit_review_in_db(
+                &mut conn,
+                1,
+                unit.id,
+                report_run_id,
+                "approved_completion",
+                None
+            )
+            .is_err()
+        );
+        transition_development_unit_run(&conn, report_run_id, "finished", None).unwrap();
+        assert!(save_development_unit_run_report(&mut conn, report_run_id, &report).is_err());
+        for (decision, note) in [
+            ("approved_completion", Some("Reviewed the implementation")),
+            ("rework_requested", Some("Handle the missing verification")),
+            ("blocked", None),
+            ("incomplete", None),
+        ] {
+            let saved = save_development_unit_review_in_db(
+                &mut conn,
+                1,
+                unit.id,
+                report_run_id,
+                decision,
+                note,
+            )
+            .unwrap();
+            assert_eq!(saved.unit_id, unit.id);
+            assert_eq!(saved.run_id, report_run_id);
+            assert_eq!(saved.decision, decision);
+        }
+        let (latest_decision, latest_note, review_count): (String, Option<String>, i64) = conn
+            .query_row(
+                "SELECT decision, note,
+                    (SELECT COUNT(*) FROM development_unit_reviews WHERE run_id = ?1)
+                 FROM development_unit_reviews WHERE run_id = ?1 ORDER BY id DESC LIMIT 1",
+                [report_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(latest_decision, "incomplete");
+        assert_eq!(latest_note, None);
+        assert_eq!(review_count, 4);
+        let persisted_units = project_development_units_in_db(&conn, 1).unwrap();
+        let persisted_unit = persisted_units
+            .iter()
+            .find(|item| item.id == unit.id)
+            .unwrap();
+        assert_eq!(persisted_unit.latest_run_id, Some(report_run_id));
+        assert_eq!(
+            persisted_unit.review_decision.as_deref(),
+            Some("incomplete")
+        );
+        assert_eq!(persisted_unit.review_note, None);
+        assert!(persisted_unit.reviewed_at.is_some());
+        assert!(
+            save_development_unit_review_in_db(
+                &mut conn,
+                1,
+                unit.id,
+                report_run_id,
+                "completed",
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            save_development_unit_review_in_db(
+                &mut conn,
+                2,
+                unit.id,
+                report_run_id,
+                "blocked",
+                None
+            )
+            .is_err()
+        );
+        let confirmed_nodes: String = conn
+            .query_row(
+                "SELECT nodes FROM project_maps WHERE project_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&confirmed_nodes).unwrap()[0]["data"]["status"],
+            "Not started"
+        );
+        for terminal_state in ["interrupted", "failed", "disconnected", "start_failed"] {
+            let run_id = create_development_unit_run(&conn, unit.id).unwrap();
+            assert!(
+                transition_development_unit_run(
+                    &conn,
+                    run_id,
+                    terminal_state,
+                    Some("Observed terminal state")
+                )
+                .unwrap()
+            );
+        }
+        let unit_status: String = conn
+            .query_row(
+                "SELECT status FROM development_units WHERE id = ?1",
+                [unit.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unit_status, "start_failed");
+        let unit_after_new_run = project_development_units_in_db(&conn, 1)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == unit.id)
+            .unwrap();
+        assert_eq!(
+            unit_after_new_run.latest_run_state.as_deref(),
+            Some("start_failed")
+        );
+        assert_eq!(unit_after_new_run.review_decision, None);
+        assert!(
+            save_development_unit_review_in_db(
+                &mut conn,
+                1,
+                unit.id,
+                report_run_id,
+                "incomplete",
+                None
+            )
+            .is_err()
+        );
+        let too_long_note = "x".repeat(2_001);
+        let latest_run_id = unit_after_new_run.latest_run_id.unwrap();
+        assert!(
+            save_development_unit_review_in_db(
+                &mut conn,
+                1,
+                unit.id,
+                latest_run_id,
+                "blocked",
+                Some(&too_long_note)
+            )
+            .is_err()
+        );
+
         assert!(record_development_unit(&mut conn, 1, 0, "a", "A stale unit", &criteria,).is_err());
         map.revision = 1;
         map.nodes[0]["data"]["questions"] = json!(["Which format?"]);
@@ -1500,18 +2409,73 @@ mod tests {
     }
 
     #[test]
+    fn design_context_uses_persisted_revision_and_marks_pending_draft_unconfirmed() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let root = canonical_project(&std::env::current_dir().unwrap()).unwrap();
+        conn.execute(
+            "INSERT INTO projects (id, name, root) VALUES (1, 'test', ?1)",
+            [&root],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO project_maps (project_id) VALUES (1)", [])
+            .unwrap();
+        let mut map = sample_map();
+        map.nodes[0]["id"] = json!("confirmed-node");
+        map.revision = save_map(&conn, 1, &map).unwrap();
+        let draft = DesignDraft {
+            goal: "Unconfirmed change".into(),
+            nodes: vec![
+                json!({"id":"draft-node","type":"component","data":{"title":"Draft","summary":"Not approved","responsibilities":["Draft responsibility"],"status":"Not started"}}),
+            ],
+            edges: vec![],
+            questions: vec![],
+            assumptions: vec![],
+        };
+        conn.execute(
+            "INSERT INTO design_drafts (project_id, base_revision, version, draft, state) VALUES (1, ?1, 2, ?2, 'pending')",
+            rusqlite::params![map.revision, serde_json::to_string(&draft).unwrap()],
+        )
+        .unwrap();
+
+        let (serialized_context, context_revision) = agent::design_context(&conn, 1).unwrap();
+        let context: Value = serde_json::from_str(&serialized_context).unwrap();
+        assert_eq!(context_revision, map.revision);
+        assert_eq!(context["mode"], "design");
+        assert_eq!(context["confirmedMap"]["revision"], map.revision);
+        assert_eq!(context["confirmedMap"]["nodes"][0]["id"], "confirmed-node");
+        assert_eq!(context["pendingDraft"]["baseRevision"], map.revision);
+        assert_eq!(context["pendingDraft"]["version"], 2);
+        assert_eq!(context["pendingDraft"]["current"], true);
+        assert_eq!(
+            context["pendingDraft"]["draft"]["nodes"][0]["id"],
+            "draft-node"
+        );
+        assert!(context["rules"].as_array().unwrap().iter().any(|rule| {
+            rule.as_str()
+                .is_some_and(|rule| rule.contains("unconfirmed"))
+        }));
+    }
+
+    #[test]
     fn design_response_requires_responsibilities_and_typed_edges() {
         let response = json!({
-            "goal":"Build a note app",
-            "nodes":[
-                {"id":"notes","title":"Notes","summary":"Owns creating and organizing notes, not account billing.","responsibilities":["Create and edit notes"],"questions":[]},
-                {"id":"storage","title":"Storage","summary":"Persists note data, not presentation.","responsibilities":["Persist notes"],"questions":[]}
-            ],
-            "edges":[{"id":"notes-storage","source":"notes","target":"storage","relation":"depends_on"}],
-            "questions":[],
-            "assumptions":[]
+            "contractVersion":1,
+            "mode":"design",
+            "context":{"mapRevision":0,"draftId":null,"draftVersion":null,"unitId":null},
+            "result":{"kind":"map_draft","message":"Proposed a notes architecture.","draft":{
+                "goal":"Build a note app",
+                "nodes":[
+                    {"id":"notes","title":"Notes","summary":"Owns creating and organizing notes, not account billing.","responsibilities":["Create and edit notes"],"questions":[]},
+                    {"id":"storage","title":"Storage","summary":"Persists note data, not presentation.","responsibilities":["Persist notes"],"questions":[]}
+                ],
+                "edges":[{"id":"notes-storage","source":"notes","target":"storage","relation":"depends_on"}],
+                "questions":[],
+                "assumptions":[]
+            }}
         }).to_string();
-        let draft = parse_design_response(&response).unwrap();
+        let draft = parse_design_response(&response, 0, None, None).unwrap();
         assert_eq!(
             draft.nodes[0]["data"]["responsibilities"][0],
             "Create and edit notes"
@@ -1523,7 +2487,8 @@ mod tests {
         assert_eq!(draft.edges[0]["targetHandle"], "target-left");
 
         let invalid_response = response.replace("depends_on", "related");
-        assert!(parse_design_response(&invalid_response).is_err());
+        assert!(parse_design_response(&invalid_response, 0, None, None).is_err());
+        assert!(parse_design_response(&response, 1, None, None).is_err());
     }
 
     #[test]

@@ -16,8 +16,14 @@ export type ComponentIcon =
   | 'shield'
   | 'review'
 
+export type DecisionQuestion = {
+  prompt: string
+  options: { label: string; recommended: boolean }[]
+}
+
 export type ComponentData = {
   title: string
+  nextRecommendationRationale?: string
   kind: string
   summary: string
   technology: string
@@ -25,7 +31,7 @@ export type ComponentData = {
   icon: ComponentIcon
   responsibilities: string[]
   files: string[]
-  questions?: string[]
+  questions?: DecisionQuestion[]
   answers?: Record<string, string>
 }
 

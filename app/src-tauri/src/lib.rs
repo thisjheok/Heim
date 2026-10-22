@@ -135,6 +135,16 @@ const SCHEMA: &str = "
         note TEXT,
         reviewed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS next_development_recommendations (
+        project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        map_revision INTEGER NOT NULL,
+        progress_key TEXT NOT NULL,
+        node_id TEXT,
+        rationale TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY(project_id, map_revision, progress_key),
+        CHECK ((node_id IS NULL AND rationale IS NULL) OR (node_id IS NOT NULL AND rationale IS NOT NULL))
+    );
 ";
 
 fn database(app: &tauri::AppHandle) -> Result<Connection, String> {
@@ -466,6 +476,43 @@ fn validate_design_draft(draft: &DesignDraft) -> Result<(), String> {
                 {
                     return Err("Design draft components must define a title and scope".into());
                 }
+                let questions = node
+                    .pointer("/data/questions")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                for question in questions {
+                    let prompt = question
+                        .get("prompt")
+                        .and_then(Value::as_str)
+                        .filter(|prompt| !prompt.trim().is_empty() && prompt.len() <= 2_000)
+                        .ok_or("Design draft question prompt is invalid")?;
+                    let options = question
+                        .get("options")
+                        .and_then(Value::as_array)
+                        .filter(|options| options.len() == 2)
+                        .ok_or("Each design question must have exactly two options")?;
+                    let mut labels = Vec::with_capacity(2);
+                    let mut recommended = 0;
+                    for option in options {
+                        let label = option
+                            .get("label")
+                            .and_then(Value::as_str)
+                            .filter(|label| !label.trim().is_empty() && label.len() <= 500)
+                            .ok_or("Design question option is invalid")?;
+                        labels.push(label);
+                        recommended += usize::from(
+                            option.get("recommended").and_then(Value::as_bool) == Some(true),
+                        );
+                    }
+                    if labels[0] == labels[1] || recommended != 1 {
+                        return Err(
+                            "Design question options must be distinct with one recommendation"
+                                .into(),
+                        );
+                    }
+                    let _ = prompt;
+                }
             }
             Some("layer") => {}
             _ => return Err("Design draft contains an unsupported node type".into()),
@@ -665,13 +712,55 @@ fn parse_design_response(
         let questions = raw
             .get("questions")
             .and_then(Value::as_array)
-            .map(|items| {
+            .map(|items| -> Result<Vec<Value>, String> {
                 items
                     .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
+                    .map(|item| {
+                        let prompt = item
+                            .get("prompt")
+                            .and_then(Value::as_str)
+                            .filter(|prompt| !prompt.trim().is_empty() && prompt.len() <= 2_000)
+                            .ok_or("Draft question prompt is invalid")?;
+                        let options = item
+                            .get("options")
+                            .and_then(Value::as_array)
+                            .filter(|options| options.len() == 2)
+                            .ok_or("Draft questions must have exactly two options")?;
+                        if prompt.trim().is_empty() || options.len() != 2 {
+                            return Err("Draft question prompt or options are invalid".into());
+                        }
+                        let options = options
+                            .iter()
+                            .map(|option| -> Result<Value, String> {
+                                let label = option
+                                    .get("label")
+                                    .and_then(Value::as_str)
+                                    .filter(|label| !label.trim().is_empty() && label.len() <= 500)
+                                    .ok_or("Draft question option is invalid")?;
+                                let recommended = option
+                                    .get("recommended")
+                                    .and_then(Value::as_bool)
+                                    .ok_or("Draft question recommendation flag is missing")?;
+                                Ok(json!({"label": label, "recommended": recommended}))
+                            })
+                            .collect::<Result<Vec<_>, String>>()?;
+                        if options[0]["label"] == options[1]["label"]
+                            || options
+                                .iter()
+                                .filter(|option| option["recommended"] == true)
+                                .count()
+                                != 1
+                        {
+                            return Err(
+                                "Draft question options must be distinct with one recommendation"
+                                    .into(),
+                            );
+                        }
+                        Ok(json!({"prompt": prompt, "options": options}))
+                    })
+                    .collect()
             })
+            .transpose()?
             .unwrap_or_default();
         let position = json!({"x": (index % 3) as i32 * 380, "y": (index / 3) as i32 * 250});
         nodes.push(json!({"id":id,"type":"component","position":position,"data":{"title":title,"summary":summary,"kind":"System responsibility","technology":"To be decided","status":"Not started","icon":"map","responsibilities":responsibilities,"files":[],"questions":questions}}));
@@ -1039,7 +1128,7 @@ pub(crate) fn node_has_unanswered_questions(node: &Value) -> bool {
         return false;
     };
     questions.iter().any(|question| {
-        let Some(question) = question.as_str() else {
+        let Some(question) = question.get("prompt").and_then(Value::as_str) else {
             return true;
         };
         !node
@@ -1896,6 +1985,7 @@ pub fn run() {
             agent::agent_status,
             agent::send_design_message,
             agent::get_or_generate_development_unit_spec,
+            agent::recommend_next_development_node,
             agent::send_development_message,
             agent::cancel_agent_turn,
             agent::answer_agent_approval,
@@ -1983,6 +2073,62 @@ mod tests {
         draft.edges.clear();
         draft.nodes[0]["data"]["responsibilities"] = json!([]);
         assert!(validate_design_draft(&draft).is_err());
+    }
+
+    #[test]
+    fn design_questions_require_two_distinct_options_and_one_recommendation() {
+        let node = json!({
+            "id":"n1",
+            "type":"component",
+            "position":{"x":0,"y":0},
+            "data":{
+                "title":"Storage",
+                "summary":"Persist application records",
+                "responsibilities":["Store records"],
+                "status":"Not started",
+                "questions":[{
+                    "prompt":"Where should records be stored?",
+                    "options":[
+                        {"label":"Local database","recommended":true},
+                        {"label":"Remote service","recommended":false}
+                    ]
+                }]
+            }
+        });
+        let mut draft = DesignDraft {
+            goal: "Build an application".into(),
+            nodes: vec![node],
+            edges: vec![],
+            questions: vec![],
+            assumptions: vec![],
+        };
+        assert!(validate_design_draft(&draft).is_ok());
+
+        draft.nodes[0]["data"]["questions"][0]["options"][1]["recommended"] = json!(true);
+        assert!(validate_design_draft(&draft).is_err());
+        draft.nodes[0]["data"]["questions"][0]["options"][1]["recommended"] = json!(false);
+        draft.nodes[0]["data"]["questions"][0]["options"][1]["label"] = json!("Local database");
+        assert!(validate_design_draft(&draft).is_err());
+    }
+
+    #[test]
+    fn unanswered_decision_blocks_development_until_an_option_or_custom_answer_is_saved() {
+        let mut node = json!({
+            "data": {
+                "questions": [{"prompt":"Where should data live?","options":[
+                    {"label":"Local","recommended":true},
+                    {"label":"Remote","recommended":false}
+                ]}]
+            }
+        });
+        assert!(node_has_unanswered_questions(&node));
+        node["data"]["answers"] = json!({"Where should data live?":"Remote"});
+        assert!(!node_has_unanswered_questions(&node));
+        node["data"]["answers"]["Where should data live?"] = json!("  ");
+        assert!(node_has_unanswered_questions(&node));
+        node["data"]["answers"]["Where should data live?"] =
+            json!("Use the customer's existing database");
+        assert!(!node_has_unanswered_questions(&node));
     }
 
     #[test]
@@ -2399,7 +2545,7 @@ mod tests {
 
         assert!(record_development_unit(&mut conn, 1, 0, "a", "A stale unit", &criteria,).is_err());
         map.revision = 1;
-        map.nodes[0]["data"]["questions"] = json!(["Which format?"]);
+        map.nodes[0]["data"]["questions"] = json!([{"prompt":"Which format?","options":[{"label":"CSV","recommended":true},{"label":"JSON","recommended":false}]}]);
         assert_eq!(save_map(&conn, 1, &map).unwrap(), 2);
         assert!(
             record_development_unit(&mut conn, 1, 2, "a", "Resolve the format", &criteria,)

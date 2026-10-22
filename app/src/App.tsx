@@ -59,6 +59,8 @@ import {
   type LayerData,
   type MapRelation,
 } from './data/projectMap'
+import { QuestionnairePanel } from './QuestionnairePanel'
+import { DemoWorkspace } from './DemoWorkspace'
 import '@xyflow/react/dist/style.css'
 import './App.css'
 
@@ -77,6 +79,8 @@ type MapProposal = { id: number; projectId: number; baseRevision: number; change
 type RuntimeInfo = { version: string; platform: string }
 type Project = { id: number; name: string; root: string }
 type StoredMap = { nodes: HeimNode[]; edges: HeimEdge[]; revision: number }
+type NextDevelopmentRecommendation = { nodeId: string; rationale: string }
+type RecommendationState = { key: string; status: 'loading' | 'ready' | 'none' | 'error'; recommendation: NextDevelopmentRecommendation | null; error?: string }
 type DesignDraft = { id: number; projectId: number; baseRevision: number; version: number; draft: { goal: string; nodes: HeimNode[]; edges: HeimEdge[]; questions: string[]; assumptions: string[] } }
 type MapEditDraftResult = { draft: DesignDraft; confirmedMap: StoredMap }
 type DevelopmentReviewDecision = 'approved_completion' | 'rework_requested' | 'blocked' | 'incomplete'
@@ -97,7 +101,7 @@ const componentTitle = (nodes: HeimNode[], id: string) => {
 }
 
 const unansweredQuestions = (data: ComponentData) =>
-  (data.questions ?? []).filter((question) => !(data.answers?.[question] ?? '').trim())
+  (data.questions ?? []).filter((question) => !(data.answers?.[question.prompt] ?? '').trim())
 
 const edgeForDisplay = (edge: HeimEdge): HeimEdge => ({
   ...edge,
@@ -126,7 +130,8 @@ function ComponentNodeView({ data, selected }: NodeProps<ComponentFlowNode>) {
   const Icon = iconByName[data.icon]
 
   return (
-    <div className={`component-node${selected ? ' is-selected' : ''}`}>
+    <div className={`component-node${selected ? ' is-selected' : ''}${data.nextRecommendationRationale ? ' is-next' : ''}`}>
+      {data.nextRecommendationRationale && <span className="next-node-badge" title={`Recommended next: ${data.nextRecommendationRationale}`} aria-label={`Recommended next: ${data.nextRecommendationRationale}`}>NEXT</span>}
       {nodeHandlePositions.map(({ side, position }) => <Handle key={`target-${side}`} id={`target-${side}`} className={`node-handle node-handle-target node-handle-${side}`} type="target" position={position} />)}
       <div className="component-node-icon">
         <Icon size={18} strokeWidth={1.8} />
@@ -307,6 +312,10 @@ function App() {
   const [draftSelectedPane, setDraftSelectedPane] = useState<'before' | 'after'>('after')
   const [developmentReady, setDevelopmentReady] = useState(false)
   const [developmentUnits, setDevelopmentUnits] = useState<DevelopmentUnit[]>([])
+  const [developmentUnitsRefreshing, setDevelopmentUnitsRefreshing] = useState(false)
+  const [recommendationState, setRecommendationState] = useState<RecommendationState | null>(null)
+  const [recommendationRetry, setRecommendationRetry] = useState(0)
+  const lastRecommendationRequest = useRef('')
   const [developmentRunReview, setDevelopmentRunReview] = useState<DevelopmentRunReview | null>(null)
   const [developmentRunReviewLoading, setDevelopmentRunReviewLoading] = useState<number | null>(null)
   const [developmentRunReviewError, setDevelopmentRunReviewError] = useState<{ runId: number; message: string } | null>(null)
@@ -331,6 +340,7 @@ function App() {
   const [projectMenuOpen, setProjectMenuOpen] = useState(false)
   const [projectSidebarCollapsed, setProjectSidebarCollapsed] = useState(false)
   const [mapRevision, setMapRevision] = useState(0)
+  const [mapStatusDismissed, setMapStatusDismissed] = useState(false)
   const [mapDirty, setMapDirty] = useState(false)
   const [editingNodeId, setEditingNodeId] = useState<string | null>(null)
   const [nodeTitle, setNodeTitle] = useState('')
@@ -348,6 +358,20 @@ function App() {
   const mapDirtyRef = useRef(false)
   const projectId = project?.id
   const draftReviewActive = !!designDraft
+  const progressKey = JSON.stringify(developmentUnits.filter((unit) => unit.projectId === projectId && unit.mapRevision === mapRevision).map((unit) => [unit.id, unit.nodeId, unit.status, unit.latestRunId, unit.latestRunState, unit.reviewDecision]))
+  const recommendationKey = `${projectId}:${mapRevision}:${progressKey}:${recommendationRetry}`
+  const currentRecommendationKey = useRef(recommendationKey)
+  currentRecommendationKey.current = recommendationKey
+  const recommendationUnitKey = projectId === undefined ? '' : `${projectId}:${mapRevision}:${selectedNodeId}`
+  const canDisplayRecommendation = backendStatus.kind === 'ready' && projectId !== undefined && developmentReady && nodes.some((node) => node.type === 'component') && !mapDirty && !draftReviewActive && !initialDesignPending && !projectBusy && !reviewingMap && !developmentUnitsRefreshing && mapProposals.length === 0
+  const canRequestRecommendation = canDisplayRecommendation && !!agentVersion && (!!developmentUnitSpecs[recommendationUnitKey] || !!developmentUnitSpecErrors[recommendationUnitKey]) && !agentRunning
+  const nextRecommendation = canDisplayRecommendation && recommendationState?.key === recommendationKey && recommendationState.status === 'ready' && nodes.some((node) => node.type === 'component' && node.id === recommendationState.recommendation?.nodeId)
+    ? recommendationState.recommendation : null
+  const displayedRecommendationState = canDisplayRecommendation && recommendationState?.key === recommendationKey ? recommendationState : null
+  const recommendationIsLoading = displayedRecommendationState?.status === 'loading'
+  const displayedNodes = useMemo(() => nodes.map((node) => node.type === 'component' && node.id === nextRecommendation?.nodeId
+    ? { ...node, data: { ...node.data, nextRecommendationRationale: nextRecommendation.rationale } }
+    : node), [nodes, nextRecommendation])
   const isChatStart = !!project && nodes.length === 0 && !designDraft && !projectHasContent
   const showChatStarter = isChatStart && (messages.length === 0 || initialDesignPending)
 
@@ -422,6 +446,31 @@ function App() {
   }, [backendStatus.kind, projectId])
 
   useEffect(() => {
+    if (!canDisplayRecommendation || projectId === undefined || recommendationState?.key === recommendationKey) return
+    if (!canRequestRecommendation || lastRecommendationRequest.current === recommendationKey) return
+    lastRecommendationRequest.current = recommendationKey
+    let active = true
+    let settled = false
+    setRecommendationState({ key: recommendationKey, status: 'loading', recommendation: null })
+    void invoke<NextDevelopmentRecommendation | null>('recommend_next_development_node', { projectId, mapRevision })
+      .then((recommendation) => {
+        settled = true
+        if (!active) return
+        setRecommendationState({ key: recommendationKey, status: recommendation ? 'ready' : 'none', recommendation })
+      })
+      .catch((error: unknown) => {
+        settled = true
+        if (active) setRecommendationState({ key: recommendationKey, status: 'error', recommendation: null, error: String(error) })
+      })
+    return () => {
+      if (currentRecommendationKey.current !== recommendationKey) {
+        active = false
+        if (!settled && lastRecommendationRequest.current === recommendationKey) lastRecommendationRequest.current = ''
+      }
+    }
+  }, [canDisplayRecommendation, canRequestRecommendation, projectId, mapRevision, recommendationKey, recommendationState?.key])
+
+  useEffect(() => {
     if (projectId === undefined || backendStatus.kind !== 'ready') return
     let active = true
     let unlisten: (() => void) | undefined
@@ -473,11 +522,13 @@ function App() {
         }
         if (payload.kind === 'files') setChangedFiles((current) => [...current, payload.text])
         if (payload.kind === 'done' || payload.kind === 'disconnected') {
+          setDevelopmentUnitsRefreshing(true)
           setAgentRunning(false)
           setApprovals([])
           void invoke<DevelopmentUnit[]>('project_development_units', { projectId })
             .then(setDevelopmentUnits)
             .catch((error: unknown) => setAgentError(`Could not refresh development run status: ${String(error)}`))
+            .finally(() => { if (active) setDevelopmentUnitsRefreshing(false) })
         }
         if (payload.kind !== 'changed') setMessages((current) => [...current, { id: crypto.randomUUID(), role: 'status', text: payload.text, time: new Date().toLocaleTimeString() }])
       }
@@ -504,6 +555,10 @@ function App() {
     }
   }, [resizingAgentPanel])
 
+  useEffect(() => {
+    setMapStatusDismissed(false)
+  }, [projectId, mapRevision, developmentReady])
+
   const selectedNode = nodes.find(
     (node): node is ComponentFlowNode =>
       node.id === selectedNodeId && node.type === 'component',
@@ -524,7 +579,7 @@ function App() {
   }, [edges, nodes, selectedNodeId])
 
   useEffect(() => {
-    if (!project || !selectedNode || !developmentReady || !agentVersion || agentRunning || projectBusy || mapDirty || draftReviewActive) return
+    if (!project || !selectedNode || !developmentReady || !agentVersion || agentRunning || recommendationIsLoading || projectBusy || mapDirty || draftReviewActive) return
     const key = developmentUnitSpecKey
     if (!key || developmentUnitSpecs[key] || developmentUnitSpecErrors[key] || unitSpecRequests.current.has(key)) return
     unitSpecRequests.current.add(key)
@@ -547,7 +602,7 @@ function App() {
       setDevelopmentUnitSpecLoading((current) => current === key ? null : current)
       setAgentRunning(false)
     })
-  }, [project, selectedNode, developmentUnitSpecKey, developmentReady, agentVersion, agentRunning, projectBusy, mapDirty, draftReviewActive, mapRevision, developmentUnitSpecs, developmentUnitSpecErrors, developmentUnitSpecRetry])
+  }, [project, selectedNode, developmentUnitSpecKey, developmentReady, agentVersion, agentRunning, recommendationIsLoading, projectBusy, mapDirty, draftReviewActive, mapRevision, developmentUnitSpecs, developmentUnitSpecErrors, developmentUnitSpecRetry])
 
   const showNotice = (message: string) => {
     setNotice(message)
@@ -906,7 +961,7 @@ function App() {
   }
 
   const startDevelopment = async () => {
-    if (!project || !selectedNode || !currentDevelopmentUnitSpec || !agentVersion || agentRunning || developmentUnitSpecSaving || draftReviewActive || mapDirty || !developmentReady || !currentDevelopmentUnitSpec.goal.trim() || currentDevelopmentUnitSpec.completionCriteria.length === 0 || unansweredQuestions(selectedNode.data).length > 0) return
+    if (!project || !selectedNode || !currentDevelopmentUnitSpec || !agentVersion || agentRunning || recommendationIsLoading || developmentUnitSpecSaving || draftReviewActive || mapDirty || !developmentReady || !currentDevelopmentUnitSpec.goal.trim() || currentDevelopmentUnitSpec.completionCriteria.length === 0 || unansweredQuestions(selectedNode.data).length > 0) return
     setAgentRunning(true)
     try {
       let spec = currentDevelopmentUnitSpec
@@ -941,7 +996,7 @@ function App() {
   const sendMessage = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const text = draft.trim()
-    if (!text || !project || !agentVersion || agentRunning || initialDesignPending || reviewingMap || draftEditDirty || mapProposals.length > 0 || reviewError || (nodes.length > 0 && !draftReviewActive && (!selectedNode || !developmentReady))) return
+    if (!text || !project || !agentVersion || agentRunning || recommendationIsLoading || initialDesignPending || reviewingMap || draftEditDirty || mapProposals.length > 0 || reviewError || (nodes.length > 0 && !draftReviewActive && (!selectedNode || !developmentReady))) return
     if (mapDirty) {
       showNotice('Save map edits as a draft and review them before sending a chat message.')
       return
@@ -1064,6 +1119,9 @@ function App() {
   const draftSelectedNode = draftEdit?.nodes.find((node) => node.id === draftSelectedNodeId)
   const activeDraftNode = draftSelectedPane === 'before' ? beforeSelectedNode : draftSelectedNode
   const DraftNodeIcon = activeDraftNode?.type === 'component' ? iconByName[activeDraftNode.data.icon] : null
+  const isUiDemo = import.meta.env.DEV && new URLSearchParams(window.location.search).has('demo')
+
+  if (isUiDemo) return <DemoWorkspace />
 
   return (
     <main className="app-shell">
@@ -1108,11 +1166,15 @@ function App() {
             <div className="map-heading-icon"><Workflow size={21} /></div>
             <div className="map-heading-copy">{!isChatStart && projectMenuControl}</div>
             <div className="map-toolbar-actions">
+              {developmentReady && <span className="recommendation-status" role="status" title={displayedRecommendationState?.error ?? nextRecommendation?.rationale}>
+                {displayedRecommendationState?.status === 'loading' ? 'Finding next…' : displayedRecommendationState?.status === 'error' ? 'Next unavailable' : displayedRecommendationState?.status === 'none' || displayedRecommendationState?.status === 'ready' && !nextRecommendation ? 'No next node' : nextRecommendation ? 'Next suggested' : ''}
+              </span>}
+              {displayedRecommendationState?.status === 'error' && <button className="button button-subtle recommendation-retry" type="button" onClick={() => setRecommendationRetry((current) => current + 1)} aria-label="Retry next-node recommendation">Retry</button>}
               {project && <button
                 className="button button-development"
                 type="button"
                 onClick={() => void startDevelopment()}
-                disabled={!agentVersion || agentRunning || developmentUnitSpecSaving || draftReviewActive || mapDirty || projectBusy || !developmentReady || !selectedNode || !currentDevelopmentUnitSpec || developmentUnitSpecLoading === developmentUnitSpecKey || !currentDevelopmentUnitSpec.goal.trim() || currentDevelopmentUnitSpec.completionCriteria.length === 0 || currentDevelopmentUnitSpec.completionCriteria.length > 20 || currentDevelopmentUnitSpec.completionCriteria.some((criterion) => criterion.length > 1000) || (!selectedNode || unansweredQuestions(selectedNode.data).length > 0)}
+                disabled={!agentVersion || agentRunning || recommendationIsLoading || developmentUnitSpecSaving || draftReviewActive || mapDirty || projectBusy || !developmentReady || !selectedNode || !currentDevelopmentUnitSpec || developmentUnitSpecLoading === developmentUnitSpecKey || !currentDevelopmentUnitSpec.goal.trim() || currentDevelopmentUnitSpec.completionCriteria.length === 0 || currentDevelopmentUnitSpec.completionCriteria.length > 20 || currentDevelopmentUnitSpec.completionCriteria.some((criterion) => criterion.length > 1000) || (!selectedNode || unansweredQuestions(selectedNode.data).length > 0)}
                 title={!selectedNode ? 'Select a node first' : developmentUnitSpecLoading === developmentUnitSpecKey ? 'AI is preparing this node’s development unit' : currentDevelopmentUnitSpec ? `Develop ${selectedNode.data.title} using its saved unit plan` : 'AI is preparing a unit plan for the selected node'}
                 aria-label={selectedNode ? `Develop selected node ${selectedNode.data.title}` : 'Select a node to develop'}
               >
@@ -1162,7 +1224,7 @@ function App() {
 
           <div className="map-canvas">
             <ReactFlow<HeimNode, HeimEdge>
-              nodes={nodes}
+              nodes={displayedNodes}
               edges={edges.map(edgeForDisplay)}
               nodeTypes={nodeTypes}
               onNodesChange={(changes) => {
@@ -1245,6 +1307,12 @@ function App() {
 
             {(isChatStart || activeWorkspaceTab === 'chat') && (
               <div className={`chat-panel${showChatStarter ? ' chat-panel-starter' : ''}`}>
+                {nodes.length > 0 && !mapStatusDismissed && <div className="map-review map-status-notice" role="status">
+                  <span>{developmentReady
+                    ? `Approved map revision ${mapRevision}. Define and confirm a target, goal, and completion criteria before starting development.`
+                    : 'Development-unit definition is locked until this map revision has an approved design draft.'}</span>
+                  <button type="button" className="map-status-dismiss" aria-label="Dismiss map status notice" onClick={() => setMapStatusDismissed(true)}><X size={16} /></button>
+                </div>}
                 <div className="chat-messages" aria-live="polite">
                   {showChatStarter && <div className="chat-start-intro"><h1>무엇을 함께 만들어볼까요?</h1></div>}
                   {!initialDesignPending && messages.map((message) => (
@@ -1268,11 +1336,6 @@ function App() {
                   <span>{designDraft.draft.nodes.length} planned nodes · {designDraft.draft.edges.length} relationships · base map revision {designDraft.baseRevision}</span>
                   {designDraft.draft.questions.map((question, index) => <small key={`q-${index}`}>Question: {question}</small>)}
                   {designDraft.draft.assumptions.map((assumption, index) => <small key={`a-${index}`}>Assumption: {assumption}</small>)}
-                </div>}
-                {nodes.length > 0 && <div className="map-review" role="status">
-                  {developmentReady
-                    ? `Approved map revision ${mapRevision}. Define and confirm a target, goal, and completion criteria before starting development.`
-                    : 'Development-unit definition is locked until this map revision has an approved design draft.'}
                 </div>}
                 {draftReviewActive && draftEditDirty && <div className="map-review" role="status">Save your direct After edits before asking the Agent to revise the draft.</div>}
                 {reviewingMap && <div className="map-review" role="status">Agent is comparing the changed code with the project map…</div>}
@@ -1312,11 +1375,11 @@ function App() {
                     value={draft}
                     rows={1}
                     placeholder={!project ? 'Choose a project folder to start chatting' : showChatStarter ? '만들고 싶은 것을 편하게 설명해 주세요' : mapDirty ? 'Save map edits as a draft before chatting…' : draftReviewActive ? 'Ask the Agent to revise the saved draft…' : nodes.length > 0 ? developmentReady ? unansweredQuestions(activeNodeData as ComponentData).length > 0 ? 'Answer the open question in Details to unlock development…' : `Request development for ${activeNodeData?.title ?? 'the selected node'}…` : 'Approve the map before requesting development…' : `Message ${activeNodeData?.title ?? 'the project'}... (⌘ ↵ to send)`}
-                    disabled={!project || !agentVersion || agentRunning || initialDesignPending || reviewingMap || draftEditDirty || mapProposals.length > 0 || !!reviewError || (nodes.length > 0 && (!developmentReady || !selectedNode))}
+                    disabled={!project || !agentVersion || agentRunning || recommendationIsLoading || initialDesignPending || reviewingMap || draftEditDirty || mapProposals.length > 0 || !!reviewError || (nodes.length > 0 && (!developmentReady || !selectedNode))}
                     onChange={(event) => setDraft(event.target.value)}
                     onKeyDown={handleComposerKeyDown}
                   />
-                  <button className="send-button" type="submit" disabled={!draft.trim() || !project || !agentVersion || agentRunning || initialDesignPending || reviewingMap || draftEditDirty || mapProposals.length > 0 || !!reviewError || (nodes.length > 0 && (!developmentReady || !selectedNode))} aria-label={agentRunning || initialDesignPending ? 'Generating design map' : draftReviewActive ? 'Request design draft revision' : nodes.length > 0 ? 'Request development for selected map node' : 'Send message'}>
+                  <button className="send-button" type="submit" disabled={!draft.trim() || !project || !agentVersion || agentRunning || recommendationIsLoading || initialDesignPending || reviewingMap || draftEditDirty || mapProposals.length > 0 || !!reviewError || (nodes.length > 0 && (!developmentReady || !selectedNode))} aria-label={agentRunning || initialDesignPending ? 'Generating design map' : draftReviewActive ? 'Request design draft revision' : nodes.length > 0 ? 'Request development for selected map node' : 'Send message'}>
                     {agentRunning || initialDesignPending ? <LoaderCircle className="send-spinner" size={17} /> : <Send size={17} />}
                   </button>
                 </form>
@@ -1368,7 +1431,7 @@ function App() {
                 <h3>Responsibilities</h3>
                 <ul className="responsibility-list">{beforeSelectedNode.data.responsibilities.map((item) => <li key={item}>{item}</li>)}</ul>
                 <dl className="detail-facts"><div><dt>Status</dt><dd>{beforeSelectedNode.data.status}</dd></div></dl>
-                {(beforeSelectedNode.data.questions ?? []).length > 0 && <div className="draft-question-panel"><h3><AlertCircle size={16} /> Open questions</h3>{beforeSelectedNode.data.questions?.map((question) => <p key={question}>{question}</p>)}</div>}
+                {(beforeSelectedNode.data.questions ?? []).length > 0 && <div className="draft-question-panel"><h3><AlertCircle size={16} /> Open questions</h3>{beforeSelectedNode.data.questions?.map((question) => <p key={question.prompt}>{question.prompt}</p>)}</div>}
                 <p className="draft-detail-hint">This is the confirmed node before the proposed changes. Select a node in After to edit its draft.</p>
               </div>
             )}
@@ -1381,7 +1444,7 @@ function App() {
                 <label>Responsibilities (one per line)<textarea value={draftSelectedNode.data.responsibilities.join('\n')} rows={4} maxLength={4000} disabled={projectBusy || agentRunning} onChange={(event) => updateDraftNode(draftSelectedNode.id, (node) => node.type === 'component' ? { ...node, data: { ...node.data, responsibilities: event.target.value.split('\n').map((item) => item.trim()).filter(Boolean) } } : node)} /></label>
                 <h3>Responsibilities</h3>
                 <ul className="responsibility-list">{draftSelectedNode.data.responsibilities.map((item) => <li key={item}>{item}</li>)}</ul>
-                <div className="draft-question-panel"><h3><AlertCircle size={16} /> Open questions for this node</h3>{(draftSelectedNode.data.questions ?? []).length > 0 ? draftSelectedNode.data.questions?.map((question) => <p key={question}>{question}</p>) : <p className="muted-copy">No unresolved decisions for this node.</p>}</div>
+                <div className="draft-question-panel"><h3><AlertCircle size={16} /> Open questions for this node</h3>{(draftSelectedNode.data.questions ?? []).length > 0 ? draftSelectedNode.data.questions?.map((question) => <p key={question.prompt}>{question.prompt}</p>) : <p className="muted-copy">No unresolved decisions for this node.</p>}</div>
                 <p className="draft-detail-hint">Edit the selected node here. The graph stays focused on structure; questions stay in the details panel.</p>
               </div>
             )}
@@ -1398,7 +1461,12 @@ function App() {
                 )}
                 <h3>Responsibility and scope</h3>
                 <p className="detail-summary-text">{activeNodeData.summary}</p>
-                {(activeNodeData.questions ?? []).length > 0 && <div className="draft-question-panel detail-question-panel"><h3><AlertCircle size={16} /> Open questions</h3>{activeNodeData.questions?.map((question) => <label className="question-answer" key={question}><span>{question}</span><textarea rows={3} placeholder="Answer this question to unlock development…" value={activeNodeData.answers?.[question] ?? ''} disabled={projectBusy} onChange={(event) => updateNodeQuestionAnswer(selectedNodeId, question, event.target.value)} /> </label>)}<small>{unansweredQuestions(activeNodeData).length > 0 ? 'Answer all questions, then save the map before development.' : 'All questions answered. Save the map to confirm these decisions.'}</small></div>}
+                <QuestionnairePanel
+                  questions={activeNodeData.questions ?? []}
+                  answers={activeNodeData.answers ?? {}}
+                  disabled={projectBusy}
+                  onAnswer={(question, answer) => updateNodeQuestionAnswer(selectedNodeId, question, answer)}
+                />
                 <h3 className="section-heading-spaced">Key responsibilities</h3>
                 <ul className="responsibility-list">
                   {activeNodeData.responsibilities.map((item) => <li key={item}>{item}</li>)}
@@ -1434,7 +1502,7 @@ function App() {
                     </div>
                     {currentDevelopmentUnitSpec.completionCriteria.length > 20 && <p className="node-unit-plan-error">A plan can have at most 20 completion criteria.</p>}
                   </>}
-                  {!currentDevelopmentUnitSpec && !developmentUnitSpecLoading && developmentReady && !mapDirty && agentVersion && unansweredQuestions(activeNodeData).length === 0 && <button className="button button-outline" type="button" onClick={retryDevelopmentUnitSpec} disabled={projectBusy}>Generate plan again</button>}
+                  {!currentDevelopmentUnitSpec && !developmentUnitSpecLoading && developmentReady && !mapDirty && agentVersion && unansweredQuestions(activeNodeData).length === 0 && <button className="button button-outline" type="button" onClick={retryDevelopmentUnitSpec} disabled={projectBusy || recommendationIsLoading}>Generate plan again</button>}
                   <p className="node-unit-plan-footer">Develop selected node saves any edits and starts this exact unit.</p>
                 </section>
                 <h3 className="section-heading-spaced">Details</h3>

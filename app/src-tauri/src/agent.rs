@@ -9,6 +9,7 @@ use std::{
     time::SystemTime,
 };
 
+use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -26,7 +27,7 @@ use crate::{
     record_development_unit, record_development_unit_run_evidence,
     save_development_unit_run_report, store_generated_development_unit_spec,
     transition_development_unit_run, update_development_unit_status,
-    validate_development_unit_spec,
+    validate_development_unit_spec, validate_map,
 };
 
 #[derive(Default)]
@@ -44,6 +45,13 @@ pub(crate) struct DesignResponse {
 pub struct DevelopmentStartResult {
     unit_id: i64,
     run_id: i64,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NextDevelopmentRecommendation {
+    node_id: String,
+    rationale: String,
 }
 
 struct Session {
@@ -74,6 +82,10 @@ struct ResponseExpectation {
     node_id: Option<String>,
     criteria_count: usize,
     result_kind: &'static str,
+}
+
+fn is_internal_design_result(kind: &str) -> bool {
+    matches!(kind, "unit_plan" | "next_development_node")
 }
 
 fn validate_agent_response(
@@ -163,6 +175,22 @@ fn validate_agent_response(
                 return Err("AI unit plan contains an invalid completion criterion".into());
             }
             goal.to_owned()
+        }
+        "next_development_node" => {
+            let node_id = result["nodeId"]
+                .as_str()
+                .filter(|id| !id.is_empty() && id.len() <= 128)
+                .ok_or("AI recommendation node ID is missing or invalid")?;
+            let rationale = result["rationale"]
+                .as_str()
+                .filter(|text| !text.trim().is_empty() && text.len() <= 1_000)
+                .ok_or("AI recommendation rationale is missing or too long")?;
+            if rationale != rationale.trim() {
+                return Err(
+                    "AI recommendation rationale must not contain surrounding whitespace".into(),
+                );
+            }
+            node_id.to_owned()
         }
         "development_report" => {
             let summary = result["summary"]
@@ -701,7 +729,7 @@ async fn read_events(
                     .lock()
                     .await
                     .as_ref()
-                    .is_some_and(|expected| expected.result_kind == "unit_plan");
+                    .is_some_and(|expected| is_internal_design_result(expected.result_kind));
                 if !internal_plan {
                     emit(&app, project_id, "status", "Agent is working…", None, None);
                 }
@@ -805,7 +833,7 @@ async fn read_events(
                     .lock()
                     .await
                     .as_ref()
-                    .is_some_and(|expected| expected.result_kind == "unit_plan");
+                    .is_some_and(|expected| is_internal_design_result(expected.result_kind));
                 if !internal_plan {
                     emit(
                         &app,
@@ -822,7 +850,7 @@ async fn read_events(
                     .lock()
                     .await
                     .as_ref()
-                    .is_some_and(|expected| expected.result_kind == "unit_plan");
+                    .is_some_and(|expected| is_internal_design_result(expected.result_kind));
                 if !internal_plan && let Some(delta) = params.get("delta").and_then(Value::as_str) {
                     emit(&app, project_id, "delta", delta, item_id(params), None);
                 }
@@ -863,7 +891,7 @@ async fn read_events(
                                     match persist {
                                         Ok(()) => {
                                             *response.lock().await = Some(text.to_owned());
-                                            if expected.result_kind != "unit_plan" {
+                                            if !is_internal_design_result(expected.result_kind) {
                                                 emit(
                                                     &app,
                                                     project_id,
@@ -887,7 +915,7 @@ async fn read_events(
                                     }
                                 }
                                 Err(error) => {
-                                    if expected.result_kind != "unit_plan" {
+                                    if !is_internal_design_result(expected.result_kind) {
                                         emit(
                                             &app,
                                             project_id,
@@ -1460,10 +1488,10 @@ pub(crate) async fn request_design_draft(
     let (context, context_revision) = design_context(&conn, project_id)?;
     let draft_instructions = match latest_draft {
         Some(draft) => format!(
-            "Revise the latest saved design draft only. Do not implement or create/edit files. Treat the saved draft below as the current user-edited source of truth; preserve stable IDs for unchanged nodes and apply the user's requested changes. Put the map payload inside result.draft in the required versioned response envelope. Its schema is {{\"goal\":string,\"nodes\":[{{\"id\":string,\"title\":string,\"summary\":string explaining the node's responsibility and boundaries,\"responsibilities\":[string],\"type\":\"component\",\"status\":\"not_started\",\"questions\":[string]}}],\"edges\":[{{\"id\":string,\"source\":string,\"target\":string,\"relation\":\"depends_on\"|\"interacts_with\"}}],\"questions\":[string],\"assumptions\":[string]}}. For depends_on, source requires target; for interacts_with, source interacts with target. Never use an untyped or generic related edge. Put unresolved decisions next to the relevant node in its questions array; use the top-level questions array only for project-wide questions. Use unique stable IDs, valid edge endpoints, at least one responsibility per node, and status not_started for every node.\n\nUser change request:\n{text}\n\nLatest saved user-edited design draft:\n{draft}"
+            "Revise the latest saved design draft only. Do not implement or create/edit files. Treat the saved draft below as the current user-edited source of truth; preserve stable IDs for unchanged nodes and apply the user's requested changes. Put the map payload inside result.draft in the required versioned response envelope. Its schema is {{\"goal\":string,\"nodes\":[{{\"id\":string,\"title\":string,\"summary\":string explaining the node's responsibility and boundaries,\"responsibilities\":[string],\"type\":\"component\",\"status\":\"not_started\",\"questions\":[{{\"prompt\":string,\"options\":[{{\"label\":string,\"recommended\":boolean}},{{\"label\":string,\"recommended\":boolean}}]}}]}}],\"edges\":[{{\"id\":string,\"source\":string,\"target\":string,\"relation\":\"depends_on\"|\"interacts_with\"}}],\"questions\":[string],\"assumptions\":[string]}}. Every node question has exactly two distinct options and exactly one recommended:true. The UI provides a third, user-entered option. Use two viable, concise alternatives and recommend the best fit to the user's stated goals. For depends_on, source requires target; for interacts_with, source interacts with target. Never use an untyped or generic related edge. Put unresolved decisions next to the relevant node in its questions array; use the top-level questions array only for project-wide questions. Use unique stable IDs, valid edge endpoints, at least one responsibility per node, and status not_started for every node.\n\nUser change request:\n{text}\n\nLatest saved user-edited design draft:\n{draft}"
         ),
         None => format!(
-            "Design a logical architecture map only. Do not implement or create/edit files. Nodes are persistent system responsibilities, not files or one-off tasks. Put the map payload inside result.draft in the required versioned response envelope. Its schema is {{\"goal\":string,\"nodes\":[{{\"id\":string,\"title\":string,\"summary\":string explaining the node's responsibility and boundaries,\"responsibilities\":[string],\"type\":\"component\",\"status\":\"not_started\",\"questions\":[string]}}],\"edges\":[{{\"id\":string,\"source\":string,\"target\":string,\"relation\":\"depends_on\"|\"interacts_with\"}}],\"questions\":[string],\"assumptions\":[string]}}. For depends_on, source requires target; for interacts_with, source interacts with target. Never use an untyped or generic related edge. Put unresolved decisions next to the relevant node in its questions array; use the top-level questions array only for project-wide questions. Use unique stable IDs, valid edge endpoints, at least one responsibility per node, and status not_started for every node.\n\nUser product description:\n{text}"
+            "Design a logical architecture map only. Do not implement or create/edit files. Nodes are persistent system responsibilities, not files or one-off tasks. Put the map payload inside result.draft in the required versioned response envelope. Its schema is {{\"goal\":string,\"nodes\":[{{\"id\":string,\"title\":string,\"summary\":string explaining the node's responsibility and boundaries,\"responsibilities\":[string],\"type\":\"component\",\"status\":\"not_started\",\"questions\":[{{\"prompt\":string,\"options\":[{{\"label\":string,\"recommended\":boolean}},{{\"label\":string,\"recommended\":boolean}}]}}]}}],\"edges\":[{{\"id\":string,\"source\":string,\"target\":string,\"relation\":\"depends_on\"|\"interacts_with\"}}],\"questions\":[string],\"assumptions\":[string]}}. Every node question has exactly two distinct options and exactly one recommended:true. The UI provides a third, user-entered option. Use two viable, concise alternatives and recommend the best fit to the user's stated goals. For depends_on, source requires target; for interacts_with, source interacts with target. Never use an untyped or generic related edge. Put unresolved decisions next to the relevant node in its questions array; use the top-level questions array only for project-wide questions. Use unique stable IDs, valid edge endpoints, at least one responsibility per node, and status not_started for every node.\n\nUser product description:\n{text}"
         ),
     };
     let (draft_id, draft_version) =
@@ -1495,6 +1523,334 @@ pub(crate) async fn request_design_draft(
         text,
         revision: context_revision,
     })
+}
+
+#[derive(Clone)]
+struct RecommendationSnapshot {
+    revision: i64,
+    candidates: Vec<Value>,
+    completed: HashSet<String>,
+    edges: Vec<Value>,
+    progress_key: String,
+}
+
+fn eligible_development_nodes(
+    nodes: &[Value],
+    edges: &[Value],
+    completed: &HashSet<String>,
+    active: &HashSet<String>,
+) -> Vec<Value> {
+    nodes
+        .iter()
+        .filter(|node| {
+            if node["type"] != "component" || node_has_unanswered_questions(node) {
+                return false;
+            }
+            let Some(id) = node["id"].as_str() else {
+                return false;
+            };
+            if completed.contains(id) || active.contains(id) {
+                return false;
+            }
+            edges
+                .iter()
+                .filter(|edge| {
+                    edge["source"].as_str() == Some(id)
+                        && edge.pointer("/data/relation").and_then(Value::as_str)
+                            == Some("depends_on")
+                })
+                .all(|edge| {
+                    edge["target"].as_str().is_some_and(|target| {
+                        completed.contains(target) && !active.contains(target)
+                    })
+                })
+        })
+        .cloned()
+        .collect()
+}
+
+fn recommendation_snapshot(
+    conn: &Connection,
+    project_id: i64,
+    map_revision: i64,
+) -> Result<RecommendationSnapshot, String> {
+    let (nodes_json, edges_json, revision): (String, String, i64) = conn
+        .query_row(
+            "SELECT nodes, edges, revision FROM project_maps WHERE project_id = ?1",
+            [project_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    if revision != map_revision || !has_current_approved_map(conn, project_id)? {
+        return Err("Approved map changed; reload before requesting a recommendation".into());
+    }
+    let pending: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM design_drafts WHERE project_id = ?1 AND state = 'pending')",
+            [project_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if pending {
+        return Err("Resolve the pending design draft before requesting a recommendation".into());
+    }
+    let nodes: Vec<Value> = serde_json::from_str(&nodes_json).map_err(|error| error.to_string())?;
+    let edges: Vec<Value> = serde_json::from_str(&edges_json).map_err(|error| error.to_string())?;
+    validate_map(&nodes, &edges)?;
+    let mut completed = HashSet::new();
+    for node in &nodes {
+        if node["type"] == "component"
+            && node
+                .pointer("/data/status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| status.trim().eq_ignore_ascii_case("completed"))
+        {
+            if let Some(id) = node["id"].as_str() {
+                completed.insert(id.to_owned());
+            }
+        }
+    }
+    let mut reviews = conn
+        .prepare(
+            "SELECT DISTINCT u.node_id FROM development_units u
+         JOIN development_unit_reviews v ON v.unit_id = u.id
+         WHERE u.project_id = ?1 AND v.decision = 'approved_completion'
+           AND v.id = (SELECT MAX(id) FROM development_unit_reviews WHERE unit_id = u.id)
+           AND v.run_id = (SELECT MAX(id) FROM development_unit_runs WHERE unit_id = u.id)",
+        )
+        .map_err(|error| error.to_string())?;
+    let reviewed = reviews
+        .query_map([project_id], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    for node_id in reviewed {
+        completed.insert(node_id.map_err(|error| error.to_string())?);
+    }
+    let mut active = HashSet::new();
+    let mut runs = conn
+        .prepare(
+            "SELECT DISTINCT u.node_id FROM development_units u
+         JOIN development_unit_runs r ON r.unit_id = u.id
+         WHERE u.project_id = ?1 AND r.state IN ('starting', 'running')",
+        )
+        .map_err(|error| error.to_string())?;
+    let running = runs
+        .query_map([project_id], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    for node_id in running {
+        active.insert(node_id.map_err(|error| error.to_string())?);
+    }
+    let candidates = eligible_development_nodes(&nodes, &edges, &completed, &active);
+    let mut unit_progress = conn
+        .prepare(
+            "SELECT u.node_id, u.status,
+                COALESCE((SELECT state FROM development_unit_runs WHERE unit_id = u.id ORDER BY id DESC LIMIT 1), ''),
+                COALESCE((SELECT decision FROM development_unit_reviews WHERE unit_id = u.id ORDER BY id DESC LIMIT 1), '')
+             FROM development_units u WHERE u.project_id = ?1 ORDER BY u.node_id, u.id",
+        )
+        .map_err(|error| error.to_string())?;
+    let unit_progress = unit_progress
+        .query_map([project_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut completed_ids = completed.iter().cloned().collect::<Vec<_>>();
+    completed_ids.sort();
+    let mut active_ids = active.iter().cloned().collect::<Vec<_>>();
+    active_ids.sort();
+    let candidate_ids = candidates
+        .iter()
+        .filter_map(|node| node["id"].as_str())
+        .collect::<Vec<_>>();
+    let progress_key = serde_json::to_string(&json!({
+        "completedNodeIds": completed_ids,
+        "activeNodeIds": active_ids,
+        "eligibleNodeIds": candidate_ids,
+        "developmentUnits": unit_progress,
+    }))
+    .map_err(|error| error.to_string())?;
+    Ok(RecommendationSnapshot {
+        revision,
+        candidates,
+        completed,
+        edges,
+        progress_key,
+    })
+}
+
+fn load_cached_recommendation(
+    conn: &Connection,
+    project_id: i64,
+    snapshot: &RecommendationSnapshot,
+) -> Result<Option<Option<NextDevelopmentRecommendation>>, String> {
+    let cached = conn
+        .query_row(
+            "SELECT node_id, rationale FROM next_development_recommendations
+             WHERE project_id = ?1 AND map_revision = ?2 AND progress_key = ?3",
+            rusqlite::params![project_id, snapshot.revision, snapshot.progress_key],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    match cached {
+        None => Ok(None),
+        Some((None, None)) => Ok(Some(None)),
+        Some((Some(node_id), Some(rationale))) => {
+            if !snapshot
+                .candidates
+                .iter()
+                .any(|candidate| candidate["id"].as_str() == Some(node_id.as_str()))
+            {
+                return Err("Cached next-node recommendation is no longer eligible".into());
+            }
+            Ok(Some(Some(NextDevelopmentRecommendation {
+                node_id,
+                rationale,
+            })))
+        }
+        Some(_) => Err("Cached next-node recommendation is incomplete".into()),
+    }
+}
+
+fn store_cached_recommendation(
+    conn: &mut Connection,
+    project_id: i64,
+    snapshot: &RecommendationSnapshot,
+    recommendation: Option<&NextDevelopmentRecommendation>,
+) -> Result<(), String> {
+    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    tx.execute(
+        "DELETE FROM next_development_recommendations WHERE project_id = ?1",
+        [project_id],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "INSERT INTO next_development_recommendations
+            (project_id, map_revision, progress_key, node_id, rationale)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            project_id,
+            snapshot.revision,
+            snapshot.progress_key,
+            recommendation.map(|item| item.node_id.as_str()),
+            recommendation.map(|item| item.rationale.as_str()),
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())
+}
+
+fn parse_recommendation(
+    response: &str,
+    revision: i64,
+    candidates: &[Value],
+) -> Result<NextDevelopmentRecommendation, String> {
+    let expected = ResponseExpectation {
+        mode: AgentMode::Design,
+        map_revision: revision,
+        draft_id: None,
+        draft_version: None,
+        unit_id: None,
+        node_id: None,
+        criteria_count: 0,
+        result_kind: "next_development_node",
+    };
+    let (result, _) = validate_agent_response(response, &expected)?;
+    let node_id = result["nodeId"]
+        .as_str()
+        .ok_or("AI recommendation node ID is missing")?;
+    if !candidates
+        .iter()
+        .any(|node| node["id"].as_str() == Some(node_id))
+    {
+        return Err("AI recommendation is not an eligible component node".into());
+    }
+    Ok(NextDevelopmentRecommendation {
+        node_id: node_id.to_owned(),
+        rationale: result["rationale"]
+            .as_str()
+            .ok_or("AI recommendation rationale is missing")?
+            .to_owned(),
+    })
+}
+
+#[tauri::command]
+pub async fn recommend_next_development_node(
+    app: AppHandle,
+    manager: State<'_, AgentManager>,
+    project_id: i64,
+    map_revision: i64,
+) -> Result<Option<NextDevelopmentRecommendation>, String> {
+    let mut conn = database(&app)?;
+    ensure_project(&conn, project_id)?;
+    let root: String = conn
+        .query_row(
+            "SELECT root FROM projects WHERE id = ?1",
+            [project_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let snapshot = recommendation_snapshot(&conn, project_id, map_revision)?;
+    if let Some(cached) = load_cached_recommendation(&conn, project_id, &snapshot)? {
+        return Ok(cached);
+    }
+    if snapshot.candidates.is_empty() {
+        store_cached_recommendation(&mut conn, project_id, &snapshot, None)?;
+        return Ok(None);
+    }
+    let context = json!({
+        "confirmedMapRevision": snapshot.revision,
+        "eligibleComponentNodes": snapshot.candidates,
+        "completedNodeIds": snapshot.completed,
+        "relationships": snapshot.edges,
+    });
+    let prompt = format!(
+        "HEIM MODE: NEXT DEVELOPMENT NODE RECOMMENDATION. This is read-only design advice: do not edit files, run commands, create development units, or start implementation. Choose exactly one best next node from eligibleComponentNodes, considering its responsibilities, prerequisites and actual progress. Only those nodes are allowed; all depends_on targets must be completed before their source can be chosen. Give a concise rationale for the choice. Return exactly one JSON object without markdown: {{\"contractVersion\":1,\"mode\":\"design\",\"context\":{{\"mapRevision\":{map_revision},\"draftId\":null,\"draftVersion\":null,\"unitId\":null}},\"result\":{{\"kind\":\"next_development_node\",\"nodeId\":string,\"rationale\":string}}}}. Echo the exact map revision.\n\nAuthoritative persisted recommendation context:\n{}",
+        serde_json::to_string_pretty(&context).map_err(|error| error.to_string())?,
+    );
+    drop(conn);
+    let response = request_design_turn(
+        &app,
+        &manager,
+        project_id,
+        &root,
+        ResponseExpectation {
+            mode: AgentMode::Design,
+            map_revision,
+            draft_id: None,
+            draft_version: None,
+            unit_id: None,
+            node_id: None,
+            criteria_count: 0,
+            result_kind: "next_development_node",
+        },
+        &prompt,
+    )
+    .await?;
+    let recommendation = parse_recommendation(&response, map_revision, &snapshot.candidates)?;
+    let mut conn = database(&app)?;
+    let current = recommendation_snapshot(&conn, project_id, map_revision)?;
+    if current.progress_key != snapshot.progress_key
+        || !current
+            .candidates
+            .iter()
+            .any(|node| node["id"].as_str() == Some(recommendation.node_id.as_str()))
+    {
+        return Err("Development progress changed; request a new recommendation".into());
+    }
+    store_cached_recommendation(&mut conn, project_id, &current, Some(&recommendation))?;
+    Ok(Some(recommendation))
 }
 
 async fn request_development_unit_plan(
@@ -1972,5 +2328,167 @@ mod tests {
             "[]",
         );
         assert!(validate_agent_response(&too_many_criteria, &expected).is_err());
+    }
+
+    #[test]
+    fn recommendation_eligibility_respects_dependency_direction_and_progress() {
+        let nodes = vec![
+            json!({"id":"storage","type":"component","data":{"status":"Not started"}}),
+            json!({"id":"api","type":"component","data":{"status":"Not started"}}),
+            json!({"id":"ui","type":"component","data":{"status":"Not started"}}),
+            json!({"id":"question","type":"component","data":{"questions":[{"prompt":"Choose storage"}]}}),
+            json!({"id":"layer","type":"layer"}),
+        ];
+        let edges = vec![
+            json!({"source":"api","target":"storage","data":{"relation":"depends_on"}}),
+            json!({"source":"ui","target":"api","data":{"relation":"interacts_with"}}),
+        ];
+        let ids = |completed: HashSet<String>, active: HashSet<String>| {
+            eligible_development_nodes(&nodes, &edges, &completed, &active)
+                .iter()
+                .map(|node| node["id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(HashSet::new(), HashSet::new()), ["storage", "ui"]);
+        assert_eq!(
+            ids(HashSet::from(["storage".into()]), HashSet::new()),
+            ["api", "ui"]
+        );
+        assert_eq!(
+            ids(
+                HashSet::from(["storage".into()]),
+                HashSet::from(["storage".into()])
+            ),
+            ["ui"]
+        );
+        assert_eq!(
+            ids(
+                HashSet::from(["storage".into()]),
+                HashSet::from(["api".into()])
+            ),
+            ["ui"]
+        );
+        assert!(
+            ids(
+                HashSet::from(["storage".into(), "api".into(), "ui".into()]),
+                HashSet::new()
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn recommendation_requires_nonempty_allowed_node_and_valid_envelope() {
+        let candidates = vec![json!({"id":"storage","type":"component"})];
+        let response = json!({
+            "contractVersion":1,
+            "mode":"design",
+            "context":{"mapRevision":3,"draftId":null,"draftVersion":null,"unitId":null},
+            "result":{"kind":"next_development_node","nodeId":"storage","rationale":"Unblocks the API."}
+        });
+        assert_eq!(
+            parse_recommendation(&response.to_string(), 3, &candidates).unwrap(),
+            NextDevelopmentRecommendation {
+                node_id: "storage".into(),
+                rationale: "Unblocks the API.".into()
+            }
+        );
+        assert!(parse_recommendation(&response.to_string(), 3, &[]).is_err());
+        for (field, invalid) in [
+            ("nodeId", json!("other")),
+            ("nodeId", json!("")),
+            ("rationale", json!("  ")),
+            ("rationale", Value::Null),
+        ] {
+            let mut invalid_response = response.clone();
+            invalid_response["result"][field] = invalid;
+            assert!(parse_recommendation(&invalid_response.to_string(), 3, &candidates).is_err());
+        }
+        let mut wrong_revision = response.clone();
+        wrong_revision["context"]["mapRevision"] = json!(2);
+        assert!(parse_recommendation(&wrong_revision.to_string(), 3, &candidates).is_err());
+    }
+
+    #[test]
+    fn recommendation_snapshot_uses_approved_map_reviews_and_active_runs() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(crate::SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO projects (id, name, root) VALUES (1, 'test', '.')",
+            [],
+        )
+        .unwrap();
+        let nodes = json!([
+            {"id":"storage","type":"component","position":{"x":0,"y":0},"data":{"title":"Storage","summary":"Store data","responsibilities":["Store data"],"status":"Not started"}},
+            {"id":"api","type":"component","position":{"x":1,"y":0},"data":{"title":"API","summary":"Expose data","responsibilities":["Expose data"],"status":"Not started"}},
+            {"id":"ui","type":"component","position":{"x":2,"y":0},"data":{"title":"UI","summary":"Display data","responsibilities":["Display data"],"status":"Completed"}}
+        ]);
+        let edges = json!([{"id":"api-storage","source":"api","target":"storage","data":{"relation":"depends_on"}}]);
+        conn.execute(
+            "INSERT INTO project_maps (project_id, nodes, edges, revision) VALUES (1, ?1, ?2, 1)",
+            rusqlite::params![nodes.to_string(), edges.to_string()],
+        )
+        .unwrap();
+        assert!(recommendation_snapshot(&conn, 1, 1).is_err());
+        conn.execute("INSERT INTO design_drafts (project_id, base_revision, version, draft, state) VALUES (1, 0, 1, '{}', 'accepted')", []).unwrap();
+        let ids = |snapshot: RecommendationSnapshot| {
+            snapshot
+                .candidates
+                .into_iter()
+                .map(|node| node["id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(recommendation_snapshot(&conn, 1, 1).unwrap()),
+            ["storage"]
+        );
+        let initial_snapshot = recommendation_snapshot(&conn, 1, 1).unwrap();
+        let cached_recommendation = NextDevelopmentRecommendation {
+            node_id: "storage".into(),
+            rationale: "It has no unfinished prerequisites.".into(),
+        };
+        store_cached_recommendation(
+            &mut conn,
+            1,
+            &initial_snapshot,
+            Some(&cached_recommendation),
+        )
+        .unwrap();
+        assert_eq!(
+            load_cached_recommendation(&conn, 1, &initial_snapshot).unwrap(),
+            Some(Some(cached_recommendation))
+        );
+        conn.execute("INSERT INTO development_units (id, project_id, map_revision, node_id, goal, completion_criteria) VALUES (1, 1, 1, 'storage', 'Store', '[\"Stored\"]')", []).unwrap();
+        conn.execute(
+            "INSERT INTO development_unit_runs (id, unit_id, state) VALUES (1, 1, 'finished')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO development_unit_reviews (unit_id, run_id, decision) VALUES (1, 1, 'approved_completion')", []).unwrap();
+        let completed_storage_snapshot = recommendation_snapshot(&conn, 1, 1).unwrap();
+        assert_eq!(ids(completed_storage_snapshot.clone()), ["api"]);
+        assert_eq!(
+            load_cached_recommendation(&conn, 1, &completed_storage_snapshot).unwrap(),
+            None,
+            "a changed development state must miss the old cache"
+        );
+        conn.execute("INSERT INTO development_units (id, project_id, map_revision, node_id, goal, completion_criteria) VALUES (2, 1, 1, 'api', 'Expose', '[\"Exposed\"]')", []).unwrap();
+        conn.execute(
+            "INSERT INTO development_unit_runs (unit_id, state) VALUES (2, 'running')",
+            [],
+        )
+        .unwrap();
+        let no_candidate_snapshot = recommendation_snapshot(&conn, 1, 1).unwrap();
+        assert!(ids(no_candidate_snapshot.clone()).is_empty());
+        store_cached_recommendation(&mut conn, 1, &no_candidate_snapshot, None).unwrap();
+        assert_eq!(
+            load_cached_recommendation(&conn, 1, &no_candidate_snapshot).unwrap(),
+            Some(None),
+            "a no-candidate result is cached too"
+        );
+        assert!(recommendation_snapshot(&conn, 1, 0).is_err());
+        conn.execute("INSERT INTO design_drafts (project_id, base_revision, version, draft, state) VALUES (1, 1, 2, '{}', 'pending')", []).unwrap();
+        assert!(recommendation_snapshot(&conn, 1, 1).is_err());
     }
 }

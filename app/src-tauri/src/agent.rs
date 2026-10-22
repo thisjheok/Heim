@@ -33,6 +33,7 @@ use crate::{
 #[derive(Default)]
 pub struct AgentManager {
     session: Mutex<Option<Session>>,
+    suppress_disconnect_events: bool,
 }
 
 pub(crate) struct DesignResponse {
@@ -365,13 +366,36 @@ fn file_snapshot(root: &Path) -> FileSnapshot {
                 || !entry.file_type().is_dir()
                 || !matches!(
                     entry.file_name().to_str(),
-                    Some(".git" | "node_modules" | "target" | "dist")
+                    Some(
+                        ".git"
+                            | "node_modules"
+                            | "target"
+                            | "dist"
+                            | "__pycache__"
+                            | ".pytest_cache"
+                            | ".mypy_cache"
+                            | ".ruff_cache"
+                            | ".tox"
+                            | ".venv"
+                            | "venv"
+                            | "env"
+                    )
                 )
         })
         .flatten()
         .take(20_000)
     {
         if !entry.file_type().is_file() {
+            continue;
+        }
+        if entry
+            .path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                matches!(extension.to_ascii_lowercase().as_str(), "pyc" | "pyo")
+            })
+        {
             continue;
         }
         if let (Ok(name), Ok(metadata)) = (entry.path().strip_prefix(root), entry.metadata()) {
@@ -626,6 +650,7 @@ async fn read_events(
     expected_response: Arc<Mutex<Option<ResponseExpectation>>>,
     active_run_id: Arc<AtomicI64>,
     root: PathBuf,
+    suppress_disconnect_event: bool,
 ) {
     let mut lines = BufReader::new(stdout).lines();
     while let Ok(Some(line)) = lines.next_line().await {
@@ -1087,14 +1112,16 @@ async fn read_events(
             }
         }
     }
-    emit(
-        &app,
-        project_id,
-        "disconnected",
-        "Agent process disconnected",
-        None,
-        None,
-    );
+    if !suppress_disconnect_event {
+        emit(
+            &app,
+            project_id,
+            "disconnected",
+            "Agent process disconnected",
+            None,
+            None,
+        );
+    }
 }
 
 async fn start_session(
@@ -1102,6 +1129,7 @@ async fn start_session(
     project_id: i64,
     root: &str,
     mode: AgentMode,
+    suppress_disconnect_event: bool,
 ) -> Result<Session, String> {
     let mut child = Command::new(codex_executable()?)
         .arg("app-server")
@@ -1140,6 +1168,7 @@ async fn start_session(
         expected_response.clone(),
         active_run_id.clone(),
         PathBuf::from(root),
+        suppress_disconnect_event,
     ));
     let mut session = Session {
         project_id,
@@ -1287,7 +1316,16 @@ async fn request_design_turn(
             *guard = None;
         }
         if guard.is_none() {
-            *guard = Some(start_session(app, project_id, root, AgentMode::Design).await?);
+            *guard = Some(
+                start_session(
+                    app,
+                    project_id,
+                    root,
+                    AgentMode::Design,
+                    manager.suppress_disconnect_events,
+                )
+                .await?,
+            );
         }
         let session = guard.as_ref().ok_or("Agent session unavailable")?;
         if session.busy.swap(true, Ordering::AcqRel) {
@@ -1378,7 +1416,8 @@ pub async fn send_development_message(
         goal = unit.goal,
     );
     *guard = None;
-    let session = match start_session(&app, project_id, &root, AgentMode::Development).await {
+    let session = match start_session(&app, project_id, &root, AgentMode::Development, false).await
+    {
         Ok(session) => session,
         Err(error) => {
             update_development_unit_status(&conn, unit.id, "start_failed", Some(&error))?;
@@ -1530,6 +1569,8 @@ struct RecommendationSnapshot {
     revision: i64,
     candidates: Vec<Value>,
     completed: HashSet<String>,
+    reported_completed: HashSet<String>,
+    recent_runs: Vec<Value>,
     edges: Vec<Value>,
     progress_key: String,
 }
@@ -1538,6 +1579,7 @@ fn eligible_development_nodes(
     nodes: &[Value],
     edges: &[Value],
     completed: &HashSet<String>,
+    reported_completed: &HashSet<String>,
     active: &HashSet<String>,
 ) -> Vec<Value> {
     nodes
@@ -1549,7 +1591,7 @@ fn eligible_development_nodes(
             let Some(id) = node["id"].as_str() else {
                 return false;
             };
-            if completed.contains(id) || active.contains(id) {
+            if completed.contains(id) || reported_completed.contains(id) || active.contains(id) {
                 return false;
             }
             edges
@@ -1561,7 +1603,8 @@ fn eligible_development_nodes(
                 })
                 .all(|edge| {
                     edge["target"].as_str().is_some_and(|target| {
-                        completed.contains(target) && !active.contains(target)
+                        (completed.contains(target) || reported_completed.contains(target))
+                            && !active.contains(target)
                     })
                 })
         })
@@ -1639,7 +1682,67 @@ fn recommendation_snapshot(
     for node_id in running {
         active.insert(node_id.map_err(|error| error.to_string())?);
     }
-    let candidates = eligible_development_nodes(&nodes, &edges, &completed, &active);
+    let mut recent_runs_stmt = conn
+        .prepare(
+            "SELECT node_id, run_id, state, outcome, summary, review_decision FROM (
+                SELECT u.node_id AS node_id, r.id AS run_id, r.state AS state,
+                    COALESCE(report.outcome, '') AS outcome,
+                    COALESCE(report.summary, '') AS summary,
+                    COALESCE((SELECT v.decision FROM development_unit_reviews v
+                        WHERE v.run_id = r.id ORDER BY v.id DESC LIMIT 1), '') AS review_decision,
+                    ROW_NUMBER() OVER (PARTITION BY u.node_id ORDER BY r.id DESC) AS row_num
+                FROM development_units u
+                JOIN development_unit_runs r ON r.unit_id = u.id
+                LEFT JOIN development_unit_run_reports report ON report.run_id = r.id
+                WHERE u.project_id = ?1 AND u.map_revision = ?2
+            ) WHERE row_num = 1 ORDER BY node_id",
+        )
+        .map_err(|error| error.to_string())?;
+    let recent_runs = recent_runs_stmt
+        .query_map(rusqlite::params![project_id, map_revision], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(
+            |(node_id, run_id, state, outcome, summary, review_decision)| {
+                json!({
+                    "nodeId": node_id,
+                    "runId": run_id,
+                    "state": state,
+                    "reportedOutcome": outcome,
+                    "summary": summary,
+                    "reviewDecision": review_decision,
+                })
+            },
+        )
+        .collect::<Vec<_>>();
+    drop(recent_runs_stmt);
+    let mut reported_completed = HashSet::new();
+    for run in &recent_runs {
+        if run["state"] == "finished"
+            && run["reportedOutcome"] == "completed"
+            && !matches!(
+                run["reviewDecision"].as_str(),
+                Some("rework_requested" | "blocked" | "incomplete")
+            )
+        {
+            if let Some(node_id) = run["nodeId"].as_str() {
+                reported_completed.insert(node_id.to_owned());
+            }
+        }
+    }
+    let candidates =
+        eligible_development_nodes(&nodes, &edges, &completed, &reported_completed, &active);
     let mut unit_progress = conn
         .prepare(
             "SELECT u.node_id, u.status,
@@ -1664,21 +1767,27 @@ fn recommendation_snapshot(
     completed_ids.sort();
     let mut active_ids = active.iter().cloned().collect::<Vec<_>>();
     active_ids.sort();
+    let mut reported_completed_ids = reported_completed.iter().cloned().collect::<Vec<_>>();
+    reported_completed_ids.sort();
     let candidate_ids = candidates
         .iter()
         .filter_map(|node| node["id"].as_str())
         .collect::<Vec<_>>();
     let progress_key = serde_json::to_string(&json!({
         "completedNodeIds": completed_ids,
+        "reportedCompletedNodeIds": reported_completed_ids,
         "activeNodeIds": active_ids,
         "eligibleNodeIds": candidate_ids,
         "developmentUnits": unit_progress,
+        "recentRuns": recent_runs,
     }))
     .map_err(|error| error.to_string())?;
     Ok(RecommendationSnapshot {
         revision,
         candidates,
         completed,
+        reported_completed,
+        recent_runs,
         edges,
         progress_key,
     })
@@ -1788,7 +1897,6 @@ fn parse_recommendation(
 #[tauri::command]
 pub async fn recommend_next_development_node(
     app: AppHandle,
-    manager: State<'_, AgentManager>,
     project_id: i64,
     map_revision: i64,
 ) -> Result<Option<NextDevelopmentRecommendation>, String> {
@@ -1813,13 +1921,36 @@ pub async fn recommend_next_development_node(
         "confirmedMapRevision": snapshot.revision,
         "eligibleComponentNodes": snapshot.candidates,
         "completedNodeIds": snapshot.completed,
+        "agentReportedCompletedNodeIds": snapshot.reported_completed,
+        "recentDevelopmentRuns": snapshot.recent_runs,
         "relationships": snapshot.edges,
     });
+    let response_contract = json!({
+        "contractVersion": 1,
+        "mode": "design",
+        "context": {
+            "mapRevision": map_revision,
+            "draftId": null,
+            "draftVersion": null,
+            "unitId": null,
+        },
+        "result": {
+            "kind": "next_development_node",
+            "nodeId": "string",
+            "rationale": "string",
+        },
+    });
     let prompt = format!(
-        "HEIM MODE: NEXT DEVELOPMENT NODE RECOMMENDATION. This is read-only design advice: do not edit files, run commands, create development units, or start implementation. Choose exactly one best next node from eligibleComponentNodes, considering its responsibilities, prerequisites and actual progress. Only those nodes are allowed; all depends_on targets must be completed before their source can be chosen. Give a concise rationale for the choice. Return exactly one JSON object without markdown: {{\"contractVersion\":1,\"mode\":\"design\",\"context\":{{\"mapRevision\":{map_revision},\"draftId\":null,\"draftVersion\":null,\"unitId\":null}},\"result\":{{\"kind\":\"next_development_node\",\"nodeId\":string,\"rationale\":string}}}}. Echo the exact map revision.\n\nAuthoritative persisted recommendation context:\n{}",
-        serde_json::to_string_pretty(&context).map_err(|error| error.to_string())?,
+        "HEIM MODE: NEXT DEVELOPMENT NODE RECOMMENDATION. This is read-only design advice: do not edit files, run commands, create development units, or start implementation. Use recentDevelopmentRuns and agentReportedCompletedNodeIds as explicit progress history. Do not recommend a node whose latest finished report says completed unless its latest review requests rework, marks it blocked, or marks it incomplete. Candidates exclude reported-completed nodes; a depends_on candidate is eligible when its target is user-approved complete or agent-reported complete. Agent reports are not independently verified: this recommendation does not approve a run or change node status. Choose exactly one best node from eligibleComponentNodes, considering map responsibilities, relationships, and recent run summaries; do not repeat already implemented work. Give a concise rationale that acknowledges relevant progress. Return one JSON object matching this contract, with string values for nodeId and rationale, and no markdown:\n{contract}\n\nProject progress context:\n{context}",
+        contract = response_contract,
+        context = serde_json::to_string_pretty(&context).map_err(|error| error.to_string())?,
     );
     drop(conn);
+    // Keep map recommendations independent from interactive design/development turns.
+    let manager = AgentManager {
+        suppress_disconnect_events: true,
+        ..AgentManager::default()
+    };
     let response = request_design_turn(
         &app,
         &manager,
@@ -2063,7 +2194,7 @@ pub async fn send_design_message(
         );
     }
     *guard = None;
-    *guard = Some(start_session(&app, project_id, &root, AgentMode::Design).await?);
+    *guard = Some(start_session(&app, project_id, &root, AgentMode::Design, false).await?);
     let session = guard.as_ref().ok_or("Agent session unavailable")?;
     if session.busy.swap(true, Ordering::AcqRel) {
         return Err("Agent is already working".into());
@@ -2343,20 +2474,38 @@ mod tests {
             json!({"source":"api","target":"storage","data":{"relation":"depends_on"}}),
             json!({"source":"ui","target":"api","data":{"relation":"interacts_with"}}),
         ];
-        let ids = |completed: HashSet<String>, active: HashSet<String>| {
-            eligible_development_nodes(&nodes, &edges, &completed, &active)
-                .iter()
-                .map(|node| node["id"].as_str().unwrap().to_owned())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(ids(HashSet::new(), HashSet::new()), ["storage", "ui"]);
+        let ids =
+            |completed: HashSet<String>, reported: HashSet<String>, active: HashSet<String>| {
+                eligible_development_nodes(&nodes, &edges, &completed, &reported, &active)
+                    .iter()
+                    .map(|node| node["id"].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            };
         assert_eq!(
-            ids(HashSet::from(["storage".into()]), HashSet::new()),
+            ids(HashSet::new(), HashSet::new(), HashSet::new()),
+            ["storage", "ui"]
+        );
+        assert_eq!(
+            ids(
+                HashSet::new(),
+                HashSet::from(["storage".into()]),
+                HashSet::new()
+            ),
+            ["api", "ui"],
+            "agent-reported completion must keep recommending a different eligible node"
+        );
+        assert_eq!(
+            ids(
+                HashSet::from(["storage".into()]),
+                HashSet::new(),
+                HashSet::new()
+            ),
             ["api", "ui"]
         );
         assert_eq!(
             ids(
                 HashSet::from(["storage".into()]),
+                HashSet::new(),
                 HashSet::from(["storage".into()])
             ),
             ["ui"]
@@ -2364,6 +2513,7 @@ mod tests {
         assert_eq!(
             ids(
                 HashSet::from(["storage".into()]),
+                HashSet::new(),
                 HashSet::from(["api".into()])
             ),
             ["ui"]
@@ -2371,6 +2521,7 @@ mod tests {
         assert!(
             ids(
                 HashSet::from(["storage".into(), "api".into(), "ui".into()]),
+                HashSet::new(),
                 HashSet::new()
             )
             .is_empty()
@@ -2465,6 +2616,22 @@ mod tests {
             [],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO development_unit_run_reports (run_id, outcome, summary, report) VALUES (1, 'completed', 'Catalog lookup was implemented.', '{}')",
+            [],
+        )
+        .unwrap();
+        let unreviewed_report_snapshot = recommendation_snapshot(&conn, 1, 1).unwrap();
+        assert_eq!(
+            ids(unreviewed_report_snapshot.clone()),
+            ["api"],
+            "a finished completed report should move the recommendation beyond its node"
+        );
+        assert!(
+            unreviewed_report_snapshot
+                .reported_completed
+                .contains("storage")
+        );
         conn.execute("INSERT INTO development_unit_reviews (unit_id, run_id, decision) VALUES (1, 1, 'approved_completion')", []).unwrap();
         let completed_storage_snapshot = recommendation_snapshot(&conn, 1, 1).unwrap();
         assert_eq!(ids(completed_storage_snapshot.clone()), ["api"]);
@@ -2490,5 +2657,28 @@ mod tests {
         assert!(recommendation_snapshot(&conn, 1, 0).is_err());
         conn.execute("INSERT INTO design_drafts (project_id, base_revision, version, draft, state) VALUES (1, 1, 2, '{}', 'pending')", []).unwrap();
         assert!(recommendation_snapshot(&conn, 1, 1).is_err());
+    }
+
+    #[test]
+    fn workspace_snapshot_excludes_python_bytecode_caches() {
+        let root = std::env::temp_dir().join(format!(
+            "heim-snapshot-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cache = root.join("__pycache__");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("module.cpython-310.pyc"), [0, 159, 146, 150]).unwrap();
+        std::fs::write(root.join("module.py"), "value = 1\n").unwrap();
+
+        let snapshot = file_snapshot(&root);
+        assert!(!snapshot.keys().any(|path| path.contains("__pycache__")));
+        assert!(!snapshot.keys().any(|path| path.ends_with(".pyc")));
+        assert!(snapshot.contains_key("module.py"));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

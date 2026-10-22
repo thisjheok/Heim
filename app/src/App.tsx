@@ -579,7 +579,7 @@ function App() {
   }, [edges, nodes, selectedNodeId])
 
   useEffect(() => {
-    if (!project || !selectedNode || !developmentReady || !agentVersion || agentRunning || recommendationIsLoading || projectBusy || mapDirty || draftReviewActive) return
+    if (!project || !selectedNode || !developmentReady || !agentVersion || agentRunning || projectBusy || mapDirty || draftReviewActive) return
     const key = developmentUnitSpecKey
     if (!key || developmentUnitSpecs[key] || developmentUnitSpecErrors[key] || unitSpecRequests.current.has(key)) return
     unitSpecRequests.current.add(key)
@@ -602,7 +602,7 @@ function App() {
       setDevelopmentUnitSpecLoading((current) => current === key ? null : current)
       setAgentRunning(false)
     })
-  }, [project, selectedNode, developmentUnitSpecKey, developmentReady, agentVersion, agentRunning, recommendationIsLoading, projectBusy, mapDirty, draftReviewActive, mapRevision, developmentUnitSpecs, developmentUnitSpecErrors, developmentUnitSpecRetry])
+  }, [project, selectedNode, developmentUnitSpecKey, developmentReady, agentVersion, agentRunning, projectBusy, mapDirty, draftReviewActive, mapRevision, developmentUnitSpecs, developmentUnitSpecErrors, developmentUnitSpecRetry])
 
   const showNotice = (message: string) => {
     setNotice(message)
@@ -904,6 +904,14 @@ function App() {
     setDevelopmentUnitSpecRetry((current) => current + 1)
   }
 
+  const activateDevelopmentForSelectedNode = () => {
+    if (!currentDevelopmentUnitSpec) {
+      retryDevelopmentUnitSpec()
+      return
+    }
+    void startDevelopment()
+  }
+
   const toggleDevelopmentRunReview = async (runId: number) => {
     if (!project) return
     if (developmentRunReview?.runId === runId) {
@@ -961,7 +969,7 @@ function App() {
   }
 
   const startDevelopment = async () => {
-    if (!project || !selectedNode || !currentDevelopmentUnitSpec || !agentVersion || agentRunning || recommendationIsLoading || developmentUnitSpecSaving || draftReviewActive || mapDirty || !developmentReady || !currentDevelopmentUnitSpec.goal.trim() || currentDevelopmentUnitSpec.completionCriteria.length === 0 || unansweredQuestions(selectedNode.data).length > 0) return
+    if (!project || !selectedNode || !currentDevelopmentUnitSpec || !agentVersion || agentRunning || developmentUnitSpecSaving || draftReviewActive || mapDirty || !developmentReady || !currentDevelopmentUnitSpec.goal.trim() || currentDevelopmentUnitSpec.completionCriteria.length === 0 || unansweredQuestions(selectedNode.data).length > 0) return
     setAgentRunning(true)
     try {
       let spec = currentDevelopmentUnitSpec
@@ -996,7 +1004,7 @@ function App() {
   const sendMessage = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const text = draft.trim()
-    if (!text || !project || !agentVersion || agentRunning || recommendationIsLoading || initialDesignPending || reviewingMap || draftEditDirty || mapProposals.length > 0 || reviewError || (nodes.length > 0 && !draftReviewActive && (!selectedNode || !developmentReady))) return
+    if (!text || !project || !agentVersion || agentRunning || initialDesignPending || reviewingMap || draftEditDirty || mapProposals.length > 0 || reviewError || (nodes.length > 0 && !draftReviewActive && (!selectedNode || !developmentReady))) return
     if (mapDirty) {
       showNotice('Save map edits as a draft and review them before sending a chat message.')
       return
@@ -1090,7 +1098,9 @@ function App() {
         setNodes(map.nodes)
         setEdges(map.edges)
         setMapRevision(map.revision)
-        setDevelopmentReady(false)
+        // Accepting a reviewed map-alignment proposal advances the revision of
+        // the already-approved map; it does not create an unapproved design draft.
+        setDevelopmentReady(true)
         setSelectedNodeId((current) => map.nodes.some((node) => node.id === current) ? current : map.nodes.find((node) => node.type === 'component')?.id ?? '')
       }
       setMapProposals((current) => current.filter((item) => item.id !== proposal.id))
@@ -1173,12 +1183,12 @@ function App() {
               {project && <button
                 className="button button-development"
                 type="button"
-                onClick={() => void startDevelopment()}
-                disabled={!agentVersion || agentRunning || recommendationIsLoading || developmentUnitSpecSaving || draftReviewActive || mapDirty || projectBusy || !developmentReady || !selectedNode || !currentDevelopmentUnitSpec || developmentUnitSpecLoading === developmentUnitSpecKey || !currentDevelopmentUnitSpec.goal.trim() || currentDevelopmentUnitSpec.completionCriteria.length === 0 || currentDevelopmentUnitSpec.completionCriteria.length > 20 || currentDevelopmentUnitSpec.completionCriteria.some((criterion) => criterion.length > 1000) || (!selectedNode || unansweredQuestions(selectedNode.data).length > 0)}
-                title={!selectedNode ? 'Select a node first' : developmentUnitSpecLoading === developmentUnitSpecKey ? 'AI is preparing this node’s development unit' : currentDevelopmentUnitSpec ? `Develop ${selectedNode.data.title} using its saved unit plan` : 'AI is preparing a unit plan for the selected node'}
-                aria-label={selectedNode ? `Develop selected node ${selectedNode.data.title}` : 'Select a node to develop'}
+                onClick={activateDevelopmentForSelectedNode}
+                disabled={!agentVersion || agentRunning || developmentUnitSpecSaving || draftReviewActive || mapDirty || projectBusy || !developmentReady || !selectedNode || developmentUnitSpecLoading === developmentUnitSpecKey || (!!currentDevelopmentUnitSpec && (!currentDevelopmentUnitSpec.goal.trim() || currentDevelopmentUnitSpec.completionCriteria.length === 0 || currentDevelopmentUnitSpec.completionCriteria.length > 20 || currentDevelopmentUnitSpec.completionCriteria.some((criterion) => criterion.length > 1000))) || (!selectedNode || unansweredQuestions(selectedNode.data).length > 0)}
+                title={!selectedNode ? 'Select a node first' : !agentVersion ? 'Connect to the Agent first' : agentRunning ? 'Wait for the current Agent request to finish' : developmentUnitSpecLoading === developmentUnitSpecKey ? 'AI is preparing this node’s development unit' : !currentDevelopmentUnitSpec ? 'Generate a development plan for this node' : `Develop ${selectedNode.data.title} using its saved unit plan`}
+                aria-label={selectedNode ? currentDevelopmentUnitSpec ? `Develop selected node ${selectedNode.data.title}` : `Generate a development plan for ${selectedNode.data.title}` : 'Select a node to develop'}
               >
-                <Code2 size={15} /> <span className="develop-label">{developmentUnitSpecLoading === developmentUnitSpecKey ? 'Preparing…' : 'Develop selected node'}</span>
+                <Code2 size={15} /> <span className="develop-label">{developmentUnitSpecLoading === developmentUnitSpecKey ? 'Preparing…' : currentDevelopmentUnitSpec ? 'Develop selected node' : 'Generate plan'}</span>
               </button>}
               {!draftReviewActive && <button className="button button-outline" type="button" onClick={addNode} disabled={!project || projectBusy}>
                 <Plus size={16} /> Add node
@@ -1324,7 +1334,6 @@ function App() {
                       </div>
                     </article>
                   ))}
-                </div>
                 {approvals.length > 0 && <div className="agent-approval" role="alert">
                   <strong>Codex requests approval{approvals.length > 1 ? ` (${approvals.length} pending)` : ''}</strong><span>{approvals[0].text}</span>
                   <button className="button button-outline" type="button" onClick={() => answerApproval('decline')}>Decline</button>
@@ -1365,6 +1374,7 @@ function App() {
                   <button className="button button-outline" type="button" onClick={reviewMapChanges} disabled={mapDirty}>Review map alignment</button>
                   {mapDirty && <small>Save map edits as a draft first.</small>}
                 </div>}
+                </div>
                 <form className="composer" onSubmit={sendMessage}>
                   {!project
                     ? <button className="composer-project-button" type="button" onClick={chooseProject} disabled={backendStatus.kind !== 'ready' || projectBusy}><FolderPlus size={15} /> Choose project</button>
@@ -1502,7 +1512,7 @@ function App() {
                     </div>
                     {currentDevelopmentUnitSpec.completionCriteria.length > 20 && <p className="node-unit-plan-error">A plan can have at most 20 completion criteria.</p>}
                   </>}
-                  {!currentDevelopmentUnitSpec && !developmentUnitSpecLoading && developmentReady && !mapDirty && agentVersion && unansweredQuestions(activeNodeData).length === 0 && <button className="button button-outline" type="button" onClick={retryDevelopmentUnitSpec} disabled={projectBusy || recommendationIsLoading}>Generate plan again</button>}
+                  {!currentDevelopmentUnitSpec && !developmentUnitSpecLoading && developmentReady && !mapDirty && agentVersion && unansweredQuestions(activeNodeData).length === 0 && <button className="button button-outline" type="button" onClick={retryDevelopmentUnitSpec} disabled={projectBusy}>Generate plan again</button>}
                   <p className="node-unit-plan-footer">Develop selected node saves any edits and starts this exact unit.</p>
                 </section>
                 <h3 className="section-heading-spaced">Details</h3>

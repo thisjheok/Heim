@@ -6,16 +6,16 @@
 
 # Heim
 
-Heim is a desktop workspace for planning and building software with an AI agent. It keeps a project's architecture map, design decisions, development units, and agent activity together so you can move from an approved design to implementation with a clear, reviewable scope.
+Heim is a desktop workspace for planning and building software with an AI agent. It keeps a project's architecture map, design decisions, development tickets, and agent activity together so you can move from an approved design to implementation with a clear, reviewable scope.
 
 ## Features
 
 - Create and edit a project's architecture map, with typed components and relationships.
 - Ask the AI agent to create or revise a design draft; review and explicitly approve the draft before it becomes the confirmed map.
-- Define a development unit around one map node, a goal, and observable completion criteria.
+- Plan work as features split into tickets (by the AI on request, or by hand). Each ticket has a goal, observable completion criteria, and the map nodes it touches; the next ticket is simply the first open one in order.
 - Run development through the Codex CLI, following its configured permissions and approval policy.
 - Review the agent's report, changed files, checks, and available run evidence before recording a review decision.
-- Store project maps, drafts, development units, reports, and reviews in a local SQLite database.
+- Store project maps, drafts, features, tickets, reports, and reviews in a local SQLite database.
 
 Heim does not claim to sandbox the agent or force approval for every command. Agent access and approvals follow the installed Codex CLI's configuration.
 

@@ -61,13 +61,25 @@ import {
 } from './data/projectMap'
 import { QuestionnairePanel } from './QuestionnairePanel'
 import { DemoWorkspace } from './DemoWorkspace'
+import { NodeTicketList, TicketBoard, type TicketBoardActions } from './TicketBoard'
+import {
+  emptyTicketBoard,
+  ticketIsRunning,
+  type Feature,
+  type Ticket,
+  type TicketBoardData,
+  type TicketInput,
+  type TicketReviewDecision,
+  type TicketReviewDecisionKind,
+  type TicketRunReview,
+} from './data/tickets'
 import '@xyflow/react/dist/style.css'
 import './App.css'
 
 type ComponentFlowNode = Node<ComponentData, 'component'>
 type LayerFlowNode = Node<LayerData, 'layer'>
-type WorkspaceTab = 'chat' | 'terminal'
-type DetailTab = 'overview' | 'files' | 'tasks' | 'relationships'
+type WorkspaceTab = 'chat' | 'tickets' | 'terminal'
+type DetailTab = 'overview' | 'files' | 'tickets' | 'relationships'
 type ChatMessage = { id: string; text: string; time: string; role: 'user' | 'agent' | 'status' }
 type AgentEvent = { projectId: number; kind: 'delta' | 'message' | 'status' | 'protocol_error' | 'files' | 'changed' | 'done' | 'disconnected' | 'approval'; text: string; itemId?: string; requestId?: number }
 type Approval = { id: number; text: string }
@@ -79,17 +91,8 @@ type MapProposal = { id: number; projectId: number; baseRevision: number; change
 type RuntimeInfo = { version: string; platform: string }
 type Project = { id: number; name: string; root: string }
 type StoredMap = { nodes: HeimNode[]; edges: HeimEdge[]; revision: number }
-type NextDevelopmentRecommendation = { nodeId: string; rationale: string }
-type RecommendationState = { key: string; status: 'loading' | 'ready' | 'none' | 'error'; recommendation: NextDevelopmentRecommendation | null; error?: string }
 type DesignDraft = { id: number; projectId: number; baseRevision: number; version: number; draft: { goal: string; nodes: HeimNode[]; edges: HeimEdge[]; questions: string[]; assumptions: string[] } }
 type MapEditDraftResult = { draft: DesignDraft; confirmedMap: StoredMap }
-type DevelopmentReviewDecision = 'approved_completion' | 'rework_requested' | 'blocked' | 'incomplete'
-type StoredDevelopmentReviewDecision = { id: number; unitId: number; runId: number; decision: DevelopmentReviewDecision; note: string | null; reviewedAt: string }
-type DevelopmentUnit = { id: number; projectId: number; mapRevision: number; nodeId: string; goal: string; completionCriteria: string[]; status: 'confirmed' | 'started' | 'start_failed'; statusDetail: string | null; createdAt: string; startedAt: string | null; latestRunId: number | null; latestRunState: 'starting' | 'running' | 'finished' | 'interrupted' | 'failed' | 'disconnected' | 'start_failed' | null; latestRunDetail: string | null; latestRunStartedAt: string | null; latestRunFinishedAt: string | null; reviewDecision: DevelopmentReviewDecision | null; reviewNote: string | null; reviewedAt: string | null }
-type DevelopmentUnitSpec = { projectId: number; mapRevision: number; nodeId: string; goal: string; completionCriteria: string[]; source: 'agent' | 'user'; version: number; updatedAt: string }
-type DevelopmentRunReport = { outcome: 'completed' | 'incomplete' | 'blocked'; summary: string; criteria: { index: number; status: 'met' | 'not_met' | 'not_run'; evidence: string[] }[]; changes: { path: string; summary: string }[]; checks: { command: string; status: 'passed' | 'failed' | 'not_run'; summary: string }[]; blockers: string[] }
-type DevelopmentRunEvidence = { id: number; kind: 'command_execution' | 'workspace_snapshot'; evidence: { command?: string; status?: string; exitCode?: number | null; durationMs?: number | null; changedFiles?: string[]; available?: boolean; error?: string }; observedAt: string }
-type DevelopmentRunReview = { runId: number; unitId: number; state: DevelopmentUnit['latestRunState']; detail: string | null; startedAt: string; finishedAt: string | null; report: DevelopmentRunReport | null; evidence: DevelopmentRunEvidence[] }
 type BackendStatus =
   | { kind: 'checking' | 'browser' }
   | { kind: 'ready'; info: RuntimeInfo }
@@ -130,8 +133,11 @@ function ComponentNodeView({ data, selected }: NodeProps<ComponentFlowNode>) {
   const Icon = iconByName[data.icon]
 
   return (
-    <div className={`component-node${selected ? ' is-selected' : ''}${data.nextRecommendationRationale ? ' is-next' : ''}`}>
-      {data.nextRecommendationRationale && <span className="next-node-badge" title={`Recommended next: ${data.nextRecommendationRationale}`} aria-label={`Recommended next: ${data.nextRecommendationRationale}`}>NEXT</span>}
+    <div className={`component-node${selected ? ' is-selected' : ''}${data.ticketSummary?.next ? ' is-next' : ''}`}>
+      {data.ticketSummary?.next && <span className="next-node-badge" title="The next ticket touches this node" aria-label="The next ticket touches this node">NEXT</span>}
+      {data.ticketSummary && (data.ticketSummary.open > 0 || data.ticketSummary.active > 0) && <span className={`node-ticket-badge${data.ticketSummary.active > 0 ? ' is-active' : ''}`} title={`${data.ticketSummary.active} in progress · ${data.ticketSummary.open} to do · ${data.ticketSummary.done} done`}>
+        {data.ticketSummary.active > 0 ? `${data.ticketSummary.active} active` : `${data.ticketSummary.open} open`}
+      </span>}
       {nodeHandlePositions.map(({ side, position }) => <Handle key={`target-${side}`} id={`target-${side}`} className={`node-handle node-handle-target node-handle-${side}`} type="target" position={position} />)}
       <div className="component-node-icon">
         <Icon size={18} strokeWidth={1.8} />
@@ -163,130 +169,16 @@ const nodeTypes = {
 
 const workspaceTabs: { id: WorkspaceTab; label: string; icon: LucideIcon }[] = [
   { id: 'chat', label: 'Chat', icon: MessageCircle },
+  { id: 'tickets', label: 'Tickets', icon: ListChecks },
   { id: 'terminal', label: 'Terminal', icon: SquareTerminal },
 ]
 
 const detailTabs: { id: DetailTab; label: string }[] = [
   { id: 'overview', label: 'Overview' },
   { id: 'files', label: 'Files' },
-  { id: 'tasks', label: 'Tasks' },
+  { id: 'tickets', label: 'Tickets' },
   { id: 'relationships', label: 'Relationships' },
 ]
-
-function parsePersistedTimestamp(value: string | null | undefined): Date | null {
-  if (!value) return null
-  const iso = value.replace(' ', 'T')
-  const timestamp = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(iso) ? iso : `${iso}Z`
-  const date = new Date(timestamp)
-  return Number.isNaN(date.getTime()) ? null : date
-}
-
-function formatPersistedTimestamp(value: string | null | undefined): string | null {
-  const date = parsePersistedTimestamp(value)
-  return date ? new Intl.DateTimeFormat(undefined, { dateStyle: 'short', timeStyle: 'medium' }).format(date) : null
-}
-
-function formatRunDuration(start: string | null | undefined, finish: string | null | undefined): string | null {
-  const startedAt = parsePersistedTimestamp(start)
-  const finishedAt = parsePersistedTimestamp(finish)
-  if (!startedAt || !finishedAt) return null
-  const seconds = Math.max(0, Math.round((finishedAt.getTime() - startedAt.getTime()) / 1000))
-  return seconds < 60
-    ? `${seconds}s`
-    : `${Math.floor(seconds / 60)}m ${seconds % 60}s`
-}
-
-const developmentReviewDecisionLabels: Record<DevelopmentReviewDecision, string> = {
-  approved_completion: 'Completion approved',
-  rework_requested: 'Rework requested',
-  blocked: 'Marked blocked',
-  incomplete: 'Marked incomplete',
-}
-
-function DevelopmentRunReviewPanel({
-  unit,
-  review,
-  loading,
-  error,
-  decisionNote,
-  decisionSaving,
-  decisionError,
-  onDecisionNoteChange,
-  onSaveDecision,
-  onToggle,
-}: {
-  unit: DevelopmentUnit
-  review: DevelopmentRunReview | null
-  loading: boolean
-  error: string | null
-  decisionNote: string
-  decisionSaving: boolean
-  decisionError: string | null
-  onDecisionNoteChange: (note: string) => void
-  onSaveDecision: (decision: DevelopmentReviewDecision, note: string) => void
-  onToggle: () => void
-}) {
-  const isOpen = review?.runId === unit.latestRunId
-  const runActive = unit.latestRunState === 'starting' || unit.latestRunState === 'running'
-  const report = isOpen ? review.report : null
-  const snapshots = isOpen ? review.evidence.filter((item) => item.kind === 'workspace_snapshot') : []
-  const commands = isOpen ? review.evidence.filter((item) => item.kind === 'command_execution') : []
-
-  return <div className="run-review">
-    <button className="run-review-toggle" type="button" onClick={onToggle} disabled={loading || runActive || !unit.latestRunId} aria-expanded={isOpen}>
-      {loading ? 'Loading run details…' : runActive ? 'Run in progress' : isOpen ? 'Hide run details' : 'Review run details'}
-    </button>
-    {error && <p className="run-review-error" role="alert">Could not load run details: {error}</p>}
-    {isOpen && <div className="run-review-content">
-      <p className="run-review-note">Agent claims do not change status by themselves. Your decision below updates this development unit; the map node’s status remains user-controlled.</p>
-      {!report
-        ? <p className="run-review-empty">No valid Agent report was saved for this run.</p>
-        : <>
-          <section className="run-review-section">
-            <h4>Agent report · {report.outcome}</h4>
-            <p>{report.summary}</p>
-            <ul className="run-review-list">
-              {report.criteria.map((criterion) => <li key={criterion.index}>
-                <strong>{criterion.status === 'met' ? 'Reported met' : criterion.status === 'not_met' ? 'Not met' : 'Not run'}</strong>
-                <span>{unit.completionCriteria[criterion.index] ?? `Criterion ${criterion.index + 1}`}</span>
-                {criterion.evidence.length > 0 && <small>{criterion.evidence.join(' · ')}</small>}
-              </li>)}
-            </ul>
-            {report.changes.length > 0 && <><h5>Agent-reported changes</h5><ul className="run-review-list">{report.changes.map((change) => <li key={`${change.path}-${change.summary}`}><code>{change.path}</code><span>{change.summary}</span></li>)}</ul></>}
-            {report.checks.length > 0 && <><h5>Agent-reported checks</h5><ul className="run-review-list">{report.checks.map((check, index) => <li key={`${check.command}-${index}`}><strong>{check.status}</strong><code>{check.command}</code><span>{check.summary}</span></li>)}</ul></>}
-            {report.blockers.length > 0 && <><h5>Blockers</h5><ul className="run-review-list">{report.blockers.map((blocker) => <li key={blocker}><span>{blocker}</span></li>)}</ul></>}
-          </section>
-        </>}
-      <section className="run-review-section">
-        <h4>Heim-observed evidence</h4>
-        {snapshots.length === 0 && commands.length === 0 && <p className="run-review-empty">No execution evidence was captured.</p>}
-        {snapshots.map((snapshot) => snapshot.evidence.available === false
-          ? <p className="run-review-empty" key={snapshot.id}>Workspace comparison unavailable: {snapshot.evidence.error ?? 'unknown error'}</p>
-          : <div key={snapshot.id}><h5>Changed files</h5>{snapshot.evidence.changedFiles?.length
-            ? <ul className="run-review-list">{snapshot.evidence.changedFiles.map((path) => <li key={path}><code>{path}</code></li>)}</ul>
-            : <p className="run-review-empty">No changed files detected in the workspace snapshot.</p>}</div>)}
-        {commands.length > 0 && <><h5>Executed commands</h5><ul className="run-review-list">{commands.map((command) => <li key={command.id}>
-          <code>{command.evidence.command ?? 'Command unavailable'}</code>
-          <span>{command.evidence.status ?? 'Unknown status'}{command.evidence.exitCode != null ? ` · exit ${command.evidence.exitCode}` : ''}</span>
-        </li>)}</ul></>}
-      </section>
-      <section className="run-review-section run-review-decision">
-        <h4>User review decision</h4>
-        {unit.reviewDecision && <p className="run-review-note"><strong>{developmentReviewDecisionLabels[unit.reviewDecision]}</strong>{unit.reviewedAt ? ` · ${formatPersistedTimestamp(unit.reviewedAt) ?? unit.reviewedAt}` : ''}{unit.reviewNote ? ` · ${unit.reviewNote}` : ''}</p>}
-        <label>Review note or rework guidance
-          <textarea rows={2} maxLength={2000} value={decisionNote} onChange={(event) => onDecisionNoteChange(event.target.value)} disabled={decisionSaving || runActive} />
-        </label>
-        {decisionError && <p className="run-review-error" role="alert">Could not save review decision: {decisionError}</p>}
-        <div className="run-review-decisions">
-          <button className="button button-primary" type="button" onClick={() => onSaveDecision('approved_completion', decisionNote)} disabled={decisionSaving || runActive}>{decisionSaving ? 'Saving…' : 'Approve completion'}</button>
-          <button className="button button-outline" type="button" onClick={() => onSaveDecision('rework_requested', decisionNote)} disabled={decisionSaving || runActive}>Request rework</button>
-          <button className="button button-outline" type="button" onClick={() => onSaveDecision('blocked', decisionNote)} disabled={decisionSaving || runActive}>Keep blocked</button>
-          <button className="button button-outline" type="button" onClick={() => onSaveDecision('incomplete', decisionNote)} disabled={decisionSaving || runActive}>Keep incomplete</button>
-        </div>
-      </section>
-    </div>}
-  </div>
-}
 
 function App() {
   const [nodes, setNodes, onNodesChange] = useNodesState<HeimNode>(initialNodes)
@@ -311,24 +203,17 @@ function App() {
   const [draftSelectedNodeId, setDraftSelectedNodeId] = useState('')
   const [draftSelectedPane, setDraftSelectedPane] = useState<'before' | 'after'>('after')
   const [developmentReady, setDevelopmentReady] = useState(false)
-  const [developmentUnits, setDevelopmentUnits] = useState<DevelopmentUnit[]>([])
-  const [developmentUnitsRefreshing, setDevelopmentUnitsRefreshing] = useState(false)
-  const [recommendationState, setRecommendationState] = useState<RecommendationState | null>(null)
-  const [recommendationRetry, setRecommendationRetry] = useState(0)
-  const lastRecommendationRequest = useRef('')
-  const [developmentRunReview, setDevelopmentRunReview] = useState<DevelopmentRunReview | null>(null)
-  const [developmentRunReviewLoading, setDevelopmentRunReviewLoading] = useState<number | null>(null)
-  const [developmentRunReviewError, setDevelopmentRunReviewError] = useState<{ runId: number; message: string } | null>(null)
-  const [developmentReviewSavingRunId, setDevelopmentReviewSavingRunId] = useState<number | null>(null)
-  const [developmentReviewErrors, setDevelopmentReviewErrors] = useState<Record<number, string>>({})
-  const [developmentReviewNotes, setDevelopmentReviewNotes] = useState<Record<number, string>>({})
-  const [developmentUnitSpecs, setDevelopmentUnitSpecs] = useState<Record<string, DevelopmentUnitSpec>>({})
-  const [developmentUnitSpecDirty, setDevelopmentUnitSpecDirty] = useState<Record<string, boolean>>({})
-  const [developmentUnitSpecLoading, setDevelopmentUnitSpecLoading] = useState<string | null>(null)
-  const [developmentUnitSpecErrors, setDevelopmentUnitSpecErrors] = useState<Record<string, string>>({})
-  const [developmentUnitSpecSaving, setDevelopmentUnitSpecSaving] = useState(false)
-  const [developmentUnitSpecRetry, setDevelopmentUnitSpecRetry] = useState(0)
-  const unitSpecRequests = useRef(new Set<string>())
+  const [ticketBoard, setTicketBoard] = useState<TicketBoardData>(emptyTicketBoard)
+  const [ticketBusy, setTicketBusy] = useState(false)
+  const [planningFeatureId, setPlanningFeatureId] = useState<number | null>(null)
+  const [expandedTicketId, setExpandedTicketId] = useState<number | null>(null)
+  const [newTicketRequest, setNewTicketRequest] = useState<{ nodeIds: string[]; nonce: number } | null>(null)
+  const [runReview, setRunReview] = useState<TicketRunReview | null>(null)
+  const [runReviewLoading, setRunReviewLoading] = useState<number | null>(null)
+  const [runReviewError, setRunReviewError] = useState<{ runId: number; message: string } | null>(null)
+  const [reviewSavingRunId, setReviewSavingRunId] = useState<number | null>(null)
+  const [reviewErrors, setReviewErrors] = useState<Record<number, string>>({})
+  const [reviewNotes, setReviewNotes] = useState<Record<number, string>>({})
   const [reviewFiles, setReviewFiles] = useState<string[]>([])
   const [reviewingMap, setReviewingMap] = useState(false)
   const [reviewError, setReviewError] = useState('')
@@ -358,20 +243,35 @@ function App() {
   const mapDirtyRef = useRef(false)
   const projectId = project?.id
   const draftReviewActive = !!designDraft
-  const progressKey = JSON.stringify(developmentUnits.filter((unit) => unit.projectId === projectId && unit.mapRevision === mapRevision).map((unit) => [unit.id, unit.nodeId, unit.status, unit.latestRunId, unit.latestRunState, unit.reviewDecision]))
-  const recommendationKey = `${projectId}:${mapRevision}:${progressKey}:${recommendationRetry}`
-  const currentRecommendationKey = useRef(recommendationKey)
-  currentRecommendationKey.current = recommendationKey
-  const recommendationUnitKey = projectId === undefined ? '' : `${projectId}:${mapRevision}:${selectedNodeId}`
-  const canDisplayRecommendation = backendStatus.kind === 'ready' && projectId !== undefined && developmentReady && nodes.some((node) => node.type === 'component') && !mapDirty && !draftReviewActive && !initialDesignPending && !projectBusy && !reviewingMap && !developmentUnitsRefreshing && mapProposals.length === 0
-  const canRequestRecommendation = canDisplayRecommendation && !!agentVersion && (!!developmentUnitSpecs[recommendationUnitKey] || !!developmentUnitSpecErrors[recommendationUnitKey]) && !agentRunning
-  const nextRecommendation = canDisplayRecommendation && recommendationState?.key === recommendationKey && recommendationState.status === 'ready' && nodes.some((node) => node.type === 'component' && node.id === recommendationState.recommendation?.nodeId)
-    ? recommendationState.recommendation : null
-  const displayedRecommendationState = canDisplayRecommendation && recommendationState?.key === recommendationKey ? recommendationState : null
-  const recommendationIsLoading = displayedRecommendationState?.status === 'loading'
-  const displayedNodes = useMemo(() => nodes.map((node) => node.type === 'component' && node.id === nextRecommendation?.nodeId
-    ? { ...node, data: { ...node.data, nextRecommendationRationale: nextRecommendation.rationale } }
-    : node), [nodes, nextRecommendation])
+  const nextTicket = ticketBoard.tickets.find((ticket) => ticket.id === ticketBoard.nextTicketId) ?? null
+  const ticketRunActive = ticketBoard.tickets.some(ticketIsRunning)
+  const developBlockedReason = !agentVersion ? 'Connect to the Agent first'
+    : !developmentReady ? 'Approve the map before developing'
+      : draftReviewActive ? 'Resolve the pending design draft first'
+        : mapDirty ? 'Save map edits as a draft and approve them first'
+          : agentRunning || ticketRunActive ? 'Wait for the current Agent request to finish'
+            : null
+  const planBlockedReason = !agentVersion ? 'Connect to the Agent first'
+    : !developmentReady ? 'Approve the map before planning tickets'
+      : agentRunning ? 'Wait for the current Agent request to finish'
+        : null
+  // Ticket progress is drawn over the map for orientation only; it is never saved into the map.
+  const displayedNodes = useMemo(() => {
+    const summaries = new Map<string, { open: number; active: number; done: number; next: boolean }>()
+    for (const ticket of ticketBoard.tickets) {
+      for (const nodeId of ticket.nodeIds) {
+        const summary = summaries.get(nodeId) ?? { open: 0, active: 0, done: 0, next: false }
+        if (ticket.status === 'todo') summary.open += 1
+        else if (ticket.status === 'in_progress') summary.active += 1
+        else summary.done += 1
+        if (ticket.id === ticketBoard.nextTicketId) summary.next = true
+        summaries.set(nodeId, summary)
+      }
+    }
+    return nodes.map((node) => node.type === 'component' && summaries.has(node.id)
+      ? { ...node, data: { ...node.data, ticketSummary: summaries.get(node.id) } }
+      : node)
+  }, [nodes, ticketBoard])
   const isChatStart = !!project && nodes.length === 0 && !designDraft && !projectHasContent
   const showChatStarter = isChatStart && (messages.length === 0 || initialDesignPending)
 
@@ -446,31 +346,6 @@ function App() {
   }, [backendStatus.kind, projectId])
 
   useEffect(() => {
-    if (!canDisplayRecommendation || projectId === undefined || recommendationState?.key === recommendationKey) return
-    if (!canRequestRecommendation || lastRecommendationRequest.current === recommendationKey) return
-    lastRecommendationRequest.current = recommendationKey
-    let active = true
-    let settled = false
-    setRecommendationState({ key: recommendationKey, status: 'loading', recommendation: null })
-    void invoke<NextDevelopmentRecommendation | null>('recommend_next_development_node', { projectId, mapRevision })
-      .then((recommendation) => {
-        settled = true
-        if (!active) return
-        setRecommendationState({ key: recommendationKey, status: recommendation ? 'ready' : 'none', recommendation })
-      })
-      .catch((error: unknown) => {
-        settled = true
-        if (active) setRecommendationState({ key: recommendationKey, status: 'error', recommendation: null, error: String(error) })
-      })
-    return () => {
-      if (currentRecommendationKey.current !== recommendationKey) {
-        active = false
-        if (!settled && lastRecommendationRequest.current === recommendationKey) lastRecommendationRequest.current = ''
-      }
-    }
-  }, [canDisplayRecommendation, canRequestRecommendation, projectId, mapRevision, recommendationKey, recommendationState?.key])
-
-  useEffect(() => {
     if (projectId === undefined || backendStatus.kind !== 'ready') return
     let active = true
     let unlisten: (() => void) | undefined
@@ -522,13 +397,11 @@ function App() {
         }
         if (payload.kind === 'files') setChangedFiles((current) => [...current, payload.text])
         if (payload.kind === 'done' || payload.kind === 'disconnected') {
-          setDevelopmentUnitsRefreshing(true)
           setAgentRunning(false)
           setApprovals([])
-          void invoke<DevelopmentUnit[]>('project_development_units', { projectId })
-            .then(setDevelopmentUnits)
-            .catch((error: unknown) => setAgentError(`Could not refresh development run status: ${String(error)}`))
-            .finally(() => { if (active) setDevelopmentUnitsRefreshing(false) })
+          void invoke<TicketBoardData>('project_ticket_board', { projectId })
+            .then((board) => { if (active) setTicketBoard(board) })
+            .catch((error: unknown) => setAgentError(`Could not refresh ticket status: ${String(error)}`))
         }
         if (payload.kind !== 'changed') setMessages((current) => [...current, { id: crypto.randomUUID(), role: 'status', text: payload.text, time: new Date().toLocaleTimeString() }])
       }
@@ -563,11 +436,7 @@ function App() {
     (node): node is ComponentFlowNode =>
       node.id === selectedNodeId && node.type === 'component',
   )
-  const developmentUnitSpecKey = project && selectedNode
-    ? `${project.id}:${mapRevision}:${selectedNode.id}`
-    : ''
-  const currentDevelopmentUnitSpec = developmentUnitSpecs[developmentUnitSpecKey]
-  const currentUnitSpecDirty = developmentUnitSpecDirty[developmentUnitSpecKey] === true
+  const selectedNodeTickets = ticketBoard.tickets.filter((ticket) => ticket.nodeIds.includes(selectedNodeId))
 
   const relatedRelationships = useMemo(() => {
     return edges.flatMap((edge) => {
@@ -577,32 +446,6 @@ function App() {
       return node ? [{ edge, node, selectedIsSource: edge.source === selectedNodeId }] : []
     })
   }, [edges, nodes, selectedNodeId])
-
-  useEffect(() => {
-    if (!project || !selectedNode || !developmentReady || !agentVersion || agentRunning || projectBusy || mapDirty || draftReviewActive) return
-    const key = developmentUnitSpecKey
-    if (!key || developmentUnitSpecs[key] || developmentUnitSpecErrors[key] || unitSpecRequests.current.has(key)) return
-    unitSpecRequests.current.add(key)
-    setDevelopmentUnitSpecLoading(key)
-    setAgentRunning(true)
-    setDevelopmentUnitSpecErrors((current) => { const next = { ...current }; delete next[key]; return next })
-    const projectId = project.id
-    const nodeId = selectedNode.id
-    void invoke<DevelopmentUnitSpec>('get_or_generate_development_unit_spec', {
-      projectId,
-      mapRevision,
-      nodeId,
-    }).then((spec) => {
-      setDevelopmentUnitSpecs((current) => ({ ...current, [key]: spec }))
-      setDevelopmentUnitSpecDirty((current) => ({ ...current, [key]: false }))
-    }).catch((error: unknown) => {
-      setDevelopmentUnitSpecErrors((current) => ({ ...current, [key]: String(error) }))
-    }).finally(() => {
-      unitSpecRequests.current.delete(key)
-      setDevelopmentUnitSpecLoading((current) => current === key ? null : current)
-      setAgentRunning(false)
-    })
-  }, [project, selectedNode, developmentUnitSpecKey, developmentReady, agentVersion, agentRunning, projectBusy, mapDirty, draftReviewActive, mapRevision, developmentUnitSpecs, developmentUnitSpecErrors, developmentUnitSpecRetry])
 
   const showNotice = (message: string) => {
     setNotice(message)
@@ -619,7 +462,7 @@ function App() {
     const map = await invoke<StoredMap>('load_project_map', { projectId: next.id })
     const pendingDraft = await invoke<DesignDraft | null>('pending_design_draft', { projectId: next.id })
     const canDevelop = await invoke<boolean>('development_ready', { projectId: next.id })
-    const units = await invoke<DevelopmentUnit[]>('project_development_units', { projectId: next.id })
+    const board = await invoke<TicketBoardData>('project_ticket_board', { projectId: next.id })
     const hasContent = await invoke<boolean>('project_has_content', { projectId: next.id })
     setNodes(map.nodes)
     setEdges(map.edges)
@@ -633,16 +476,16 @@ function App() {
     setDraftSelectedPane('after')
     setDraftEditDirty(false)
     setDevelopmentReady(canDevelop)
-    setDevelopmentUnits(units)
-    setDevelopmentRunReview(null)
-    setDevelopmentRunReviewError(null)
-    setDevelopmentRunReviewLoading(null)
-    setDevelopmentReviewSavingRunId(null)
-    setDevelopmentReviewErrors({})
-    setDevelopmentReviewNotes({})
-    setDevelopmentUnitSpecs({})
-    setDevelopmentUnitSpecDirty({})
-    setDevelopmentUnitSpecErrors({})
+    setTicketBoard(board)
+    setExpandedTicketId(null)
+    setNewTicketRequest(null)
+    setPlanningFeatureId(null)
+    setRunReview(null)
+    setRunReviewError(null)
+    setRunReviewLoading(null)
+    setReviewSavingRunId(null)
+    setReviewErrors({})
+    setReviewNotes({})
     setMapRevision(map.revision)
     setMapDirty(false)
     mapDirtyRef.current = false
@@ -871,134 +714,165 @@ function App() {
     markMapDirty()
   }
 
-  const saveDevelopmentUnitSpec = async () => {
-    if (!project || !selectedNode || !currentDevelopmentUnitSpec) return null
+  const statusMessage = (text: string) => setMessages((current) => [...current, { id: crypto.randomUUID(), role: 'status', text, time: new Date().toLocaleTimeString() }])
+
+  // Every ticket command returns the refreshed board, so the UI never computes progress itself.
+  const runTicketCommand = async (command: string, args: Record<string, unknown>, failure: string) => {
+    if (!project) return null
+    const projectId = project.id
+    setTicketBusy(true)
     try {
-      const saved = await invoke<DevelopmentUnitSpec>('save_development_unit_spec', {
-        projectId: project.id,
-        mapRevision,
-        nodeId: selectedNode.id,
-        expectedVersion: currentDevelopmentUnitSpec.version,
-        goal: currentDevelopmentUnitSpec.goal,
-        completionCriteria: currentDevelopmentUnitSpec.completionCriteria,
-      })
-      setDevelopmentUnitSpecs((current) => ({ ...current, [developmentUnitSpecKey]: saved }))
-      setDevelopmentUnitSpecDirty((current) => ({ ...current, [developmentUnitSpecKey]: false }))
-      setDevelopmentUnitSpecErrors((current) => { const next = { ...current }; delete next[developmentUnitSpecKey]; return next })
-      return saved
+      const board = await invoke<TicketBoardData>(command, { projectId, ...args })
+      if (project?.id === projectId) setTicketBoard(board)
+      return board
     } catch (error) {
-      setDevelopmentUnitSpecErrors((current) => ({ ...current, [developmentUnitSpecKey]: String(error) }))
+      showNotice(`${failure}: ${String(error)}`)
+      return null
+    } finally {
+      setTicketBusy(false)
+    }
+  }
+
+  const refreshTicketBoard = async () => {
+    if (!project) return null
+    try {
+      const board = await invoke<TicketBoardData>('project_ticket_board', { projectId: project.id })
+      setTicketBoard(board)
+      return board
+    } catch (error) {
+      setAgentError(`Could not refresh tickets: ${String(error)}`)
       return null
     }
   }
 
-  const saveSelectedDevelopmentUnitSpec = async () => {
-    if (developmentUnitSpecSaving) return
-    setDevelopmentUnitSpecSaving(true)
-    await saveDevelopmentUnitSpec()
-    setDevelopmentUnitSpecSaving(false)
-  }
-
-  const retryDevelopmentUnitSpec = () => {
-    setDevelopmentUnitSpecErrors((current) => { const next = { ...current }; delete next[developmentUnitSpecKey]; return next })
-    setDevelopmentUnitSpecRetry((current) => current + 1)
-  }
-
-  const activateDevelopmentForSelectedNode = () => {
-    if (!currentDevelopmentUnitSpec) {
-      retryDevelopmentUnitSpec()
-      return
-    }
-    void startDevelopment()
-  }
-
-  const toggleDevelopmentRunReview = async (runId: number) => {
-    if (!project) return
-    if (developmentRunReview?.runId === runId) {
-      setDevelopmentRunReview(null)
-      setDevelopmentRunReviewError(null)
-      return
-    }
-    setDevelopmentRunReview(null)
-    setDevelopmentRunReviewError(null)
-    setDevelopmentRunReviewLoading(runId)
-    const projectId = project.id
-    try {
-      const review = await invoke<DevelopmentRunReview>('development_unit_run_review', { projectId, runId })
-      if (project?.id === projectId) setDevelopmentRunReview(review)
-    } catch (error) {
-      if (project?.id === projectId) setDevelopmentRunReviewError({ runId, message: String(error) })
-    } finally {
-      setDevelopmentRunReviewLoading((current) => current === runId ? null : current)
-    }
-  }
-
-  const saveDevelopmentReview = async (
-    unit: DevelopmentUnit,
-    decision: DevelopmentReviewDecision,
-    note: string,
-  ) => {
-    if (!project || !unit.latestRunId || developmentReviewSavingRunId !== null) return
-    if (decision === 'approved_completion' && !window.confirm(
-      'Approve this development unit as complete? This records your review decision only; it does not change the architecture node status.',
-    )) return
-
-    const projectId = project.id
-    const runId = unit.latestRunId
-    setDevelopmentReviewSavingRunId(runId)
-    setDevelopmentReviewErrors((current) => { const next = { ...current }; delete next[runId]; return next })
-    try {
-      const saved = await invoke<StoredDevelopmentReviewDecision>('save_development_unit_review', {
-        projectId,
-        unitId: unit.id,
-        runId,
-        decision,
-        note,
-      })
-      if (project?.id === projectId) {
-        setDevelopmentUnits((current) => current.map((item) => item.id === unit.id
-          ? { ...item, reviewDecision: saved.decision, reviewNote: saved.note, reviewedAt: saved.reviewedAt }
-          : item))
-        setDevelopmentReviewNotes((current) => ({ ...current, [runId]: saved.note ?? '' }))
+  const announceCompletedFeatures = (before: TicketBoardData, after: TicketBoardData) => {
+    for (const feature of after.features) {
+      if (feature.completed && !before.features.find((item) => item.id === feature.id)?.completed) {
+        showNotice(`Feature complete: ${feature.title}`)
+        statusMessage(`Feature “${feature.title}” is complete — all ${feature.ticketCount} tickets are done.`)
       }
-    } catch (error) {
-      if (project?.id === projectId) setDevelopmentReviewErrors((current) => ({ ...current, [runId]: String(error) }))
-    } finally {
-      setDevelopmentReviewSavingRunId((current) => current === runId ? null : current)
     }
   }
 
-  const startDevelopment = async () => {
-    if (!project || !selectedNode || !currentDevelopmentUnitSpec || !agentVersion || agentRunning || developmentUnitSpecSaving || draftReviewActive || mapDirty || !developmentReady || !currentDevelopmentUnitSpec.goal.trim() || currentDevelopmentUnitSpec.completionCriteria.length === 0 || unansweredQuestions(selectedNode.data).length > 0) return
+  const toggleRunReview = async (runId: number) => {
+    if (!project) return
+    if (runReview?.runId === runId) {
+      setRunReview(null)
+      setRunReviewError(null)
+      return
+    }
+    setRunReview(null)
+    setRunReviewError(null)
+    setRunReviewLoading(runId)
+    const projectId = project.id
+    try {
+      const review = await invoke<TicketRunReview>('ticket_run_review', { projectId, runId })
+      if (project?.id === projectId) setRunReview(review)
+    } catch (error) {
+      if (project?.id === projectId) setRunReviewError({ runId, message: String(error) })
+    } finally {
+      setRunReviewLoading((current) => current === runId ? null : current)
+    }
+  }
+
+  const saveTicketReview = async (ticket: Ticket, decision: TicketReviewDecisionKind, note: string) => {
+    if (!project || !ticket.latestRunId || reviewSavingRunId !== null) return
+    if (decision === 'approved_completion' && !window.confirm(
+      'Approve this run and close the ticket? This records your review only; map nodes are not changed.',
+    )) return
+    const projectId = project.id
+    const runId = ticket.latestRunId
+    const before = ticketBoard
+    setReviewSavingRunId(runId)
+    setReviewErrors((current) => { const next = { ...current }; delete next[runId]; return next })
+    try {
+      const saved = await invoke<TicketReviewDecision>('save_ticket_review', { projectId, ticketId: ticket.id, runId, decision, note })
+      if (project?.id !== projectId) return
+      setReviewNotes((current) => ({ ...current, [runId]: saved.note ?? '' }))
+      const after = await refreshTicketBoard()
+      if (after) announceCompletedFeatures(before, after)
+    } catch (error) {
+      if (project?.id === projectId) setReviewErrors((current) => ({ ...current, [runId]: String(error) }))
+    } finally {
+      setReviewSavingRunId((current) => current === runId ? null : current)
+    }
+  }
+
+  const startTicket = async (ticketId: number) => {
+    const ticket = ticketBoard.tickets.find((item) => item.id === ticketId)
+    if (!project || !ticket || developBlockedReason) return
     setAgentRunning(true)
     try {
-      let spec = currentDevelopmentUnitSpec
-      if (currentUnitSpecDirty) {
-        setDevelopmentUnitSpecSaving(true)
-        const saved = await saveDevelopmentUnitSpec()
-        setDevelopmentUnitSpecSaving(false)
-        if (!saved) throw new Error(developmentUnitSpecErrors[developmentUnitSpecKey] ?? 'Could not save the edited unit plan')
-        spec = saved
-      }
-      const { unitId } = await invoke<{ unitId: number; runId: number }>('send_development_message', {
-        projectId: project.id,
-        mapRevision,
-        nodeId: selectedNode.id,
-        goal: spec.goal.trim(),
-        completionCriteria: spec.completionCriteria,
-      })
-      setMessages((current) => [...current, { id: crypto.randomUUID(), role: 'status', text: `Started development unit #${unitId} for ${selectedNode.data.title} against map revision ${mapRevision}.`, time: new Date().toLocaleTimeString() }])
-      void invoke<DevelopmentUnit[]>('project_development_units', { projectId: project.id })
-        .then(setDevelopmentUnits)
-        .catch((error: unknown) => setAgentError(`Could not refresh development run status: ${String(error)}`))
+      const { runId } = await invoke<{ ticketId: number; runId: number }>('start_ticket_development', { projectId: project.id, ticketId })
+      statusMessage(`Started ticket “${ticket.title}” (run #${runId}) against map revision ${mapRevision}.`)
+      setExpandedTicketId(ticketId)
     } catch (error) {
       setAgentRunning(false)
-      setDevelopmentUnitSpecSaving(false)
-      setMessages((current) => [...current, { id: crypto.randomUUID(), role: 'status', text: `Could not start development: ${String(error)}`, time: new Date().toLocaleTimeString() }])
-      void invoke<DevelopmentUnit[]>('project_development_units', { projectId: project.id })
-        .then(setDevelopmentUnits)
-        .catch((refreshError: unknown) => setAgentError(`Could not refresh development units: ${String(refreshError)}`))
+      statusMessage(`Could not start ticket “${ticket.title}”: ${String(error)}`)
+    } finally {
+      void refreshTicketBoard()
     }
+  }
+
+  const planFeature = async (featureId: number) => {
+    if (!project || planBlockedReason || planningFeatureId !== null) return
+    const feature = ticketBoard.features.find((item) => item.id === featureId)
+    setPlanningFeatureId(featureId)
+    setAgentRunning(true)
+    try {
+      const created = await invoke<number[]>('plan_feature_tickets', { projectId: project.id, featureId })
+      showNotice(`AI added ${created.length} tickets to ${feature?.title ?? 'the feature'}. Review and edit them before developing.`)
+      await refreshTicketBoard()
+    } catch (error) {
+      showNotice(`Could not plan tickets: ${String(error)}`)
+    } finally {
+      setPlanningFeatureId(null)
+      setAgentRunning(false)
+    }
+  }
+
+  const ticketActions: TicketBoardActions = {
+    selectNode: (nodeId) => {
+      setSelectedNodeId(nodeId)
+      setActiveDetailTab('tickets')
+      const node = nodes.find((item) => item.id === nodeId)
+      if (node && flow) void flow.setCenter(node.position.x + 120, node.position.y + 40, { duration: 350, zoom: flow.getZoom() })
+    },
+    expandTicket: setExpandedTicketId,
+    createFeature: (title, description) => runTicketCommand('create_feature', { title, description }, 'Could not create feature').then(Boolean),
+    updateFeature: (featureId, title, description) => runTicketCommand('update_feature', { featureId, title, description }, 'Could not update feature').then(Boolean),
+    deleteFeature: (feature: Feature) => {
+      if (!window.confirm(`Delete feature “${feature.title}”? Its tickets are kept without a feature.`)) return
+      void runTicketCommand('delete_feature', { featureId: feature.id }, 'Could not delete feature')
+    },
+    moveFeature: (featureId, direction) => { void runTicketCommand('move_feature', { featureId, direction }, 'Could not reorder features') },
+    planFeature: (featureId) => { void planFeature(featureId) },
+    createTicket: (input: TicketInput) => runTicketCommand('create_ticket', { input }, 'Could not create ticket').then(Boolean),
+    updateTicket: (ticketId, input: TicketInput) => runTicketCommand('update_ticket', { ticketId, input }, 'Could not update ticket').then(Boolean),
+    deleteTicket: (ticket) => {
+      if (!window.confirm(`Delete ticket “${ticket.title}” and its run history?`)) return
+      void runTicketCommand('delete_ticket', { ticketId: ticket.id }, 'Could not delete ticket')
+    },
+    moveTicket: (ticketId, direction) => { void runTicketCommand('move_ticket', { ticketId, direction }, 'Could not reorder tickets') },
+    setTicketStatus: (ticketId, status) => {
+      const before = ticketBoard
+      void runTicketCommand('set_ticket_status', { ticketId, status }, 'Could not update ticket status')
+        .then((after) => { if (after) announceCompletedFeatures(before, after) })
+    },
+    startTicket: (ticketId) => { void startTicket(ticketId) },
+    toggleRunReview: (runId) => { void toggleRunReview(runId) },
+    reviewNoteChange: (runId, note) => setReviewNotes((current) => ({ ...current, [runId]: note })),
+    saveReview: (ticket, decision, note) => { void saveTicketReview(ticket, decision, note) },
+  }
+
+  const openTicket = (ticketId: number) => {
+    setActiveWorkspaceTab('tickets')
+    setExpandedTicketId(ticketId)
+  }
+
+  const requestTicketForNode = (nodeId: string) => {
+    setActiveWorkspaceTab('tickets')
+    setNewTicketRequest({ nodeIds: [nodeId], nonce: Date.now() })
   }
 
   const sendMessage = async (event: FormEvent<HTMLFormElement>) => {
@@ -1176,19 +1050,15 @@ function App() {
             <div className="map-heading-icon"><Workflow size={21} /></div>
             <div className="map-heading-copy">{!isChatStart && projectMenuControl}</div>
             <div className="map-toolbar-actions">
-              {developmentReady && <span className="recommendation-status" role="status" title={displayedRecommendationState?.error ?? nextRecommendation?.rationale}>
-                {displayedRecommendationState?.status === 'loading' ? 'Finding next…' : displayedRecommendationState?.status === 'error' ? 'Next unavailable' : displayedRecommendationState?.status === 'none' || displayedRecommendationState?.status === 'ready' && !nextRecommendation ? 'No next node' : nextRecommendation ? 'Next suggested' : ''}
-              </span>}
-              {displayedRecommendationState?.status === 'error' && <button className="button button-subtle recommendation-retry" type="button" onClick={() => setRecommendationRetry((current) => current + 1)} aria-label="Retry next-node recommendation">Retry</button>}
               {project && <button
                 className="button button-development"
                 type="button"
-                onClick={activateDevelopmentForSelectedNode}
-                disabled={!agentVersion || agentRunning || developmentUnitSpecSaving || draftReviewActive || mapDirty || projectBusy || !developmentReady || !selectedNode || developmentUnitSpecLoading === developmentUnitSpecKey || (!!currentDevelopmentUnitSpec && (!currentDevelopmentUnitSpec.goal.trim() || currentDevelopmentUnitSpec.completionCriteria.length === 0 || currentDevelopmentUnitSpec.completionCriteria.length > 20 || currentDevelopmentUnitSpec.completionCriteria.some((criterion) => criterion.length > 1000))) || (!selectedNode || unansweredQuestions(selectedNode.data).length > 0)}
-                title={!selectedNode ? 'Select a node first' : !agentVersion ? 'Connect to the Agent first' : agentRunning ? 'Wait for the current Agent request to finish' : developmentUnitSpecLoading === developmentUnitSpecKey ? 'AI is preparing this node’s development unit' : !currentDevelopmentUnitSpec ? 'Generate a development plan for this node' : `Develop ${selectedNode.data.title} using its saved unit plan`}
-                aria-label={selectedNode ? currentDevelopmentUnitSpec ? `Develop selected node ${selectedNode.data.title}` : `Generate a development plan for ${selectedNode.data.title}` : 'Select a node to develop'}
+                onClick={() => { if (nextTicket) void startTicket(nextTicket.id); else setActiveWorkspaceTab('tickets') }}
+                disabled={projectBusy || ticketBusy || (!!nextTicket && !!developBlockedReason)}
+                title={!nextTicket ? 'No open ticket — open the Tickets tab to plan work' : developBlockedReason ?? `Start the next ticket: ${nextTicket.title}`}
+                aria-label={nextTicket ? `Develop next ticket ${nextTicket.title}` : 'Open tickets'}
               >
-                <Code2 size={15} /> <span className="develop-label">{developmentUnitSpecLoading === developmentUnitSpecKey ? 'Preparing…' : currentDevelopmentUnitSpec ? 'Develop selected node' : 'Generate plan'}</span>
+                <Code2 size={15} /> <span className="develop-label">{nextTicket ? `Develop next: ${nextTicket.title}` : 'Plan tickets'}</span>
               </button>}
               {!draftReviewActive && <button className="button button-outline" type="button" onClick={addNode} disabled={!project || projectBusy}>
                 <Plus size={16} /> Add node
@@ -1319,8 +1189,8 @@ function App() {
               <div className={`chat-panel${showChatStarter ? ' chat-panel-starter' : ''}`}>
                 {nodes.length > 0 && !mapStatusDismissed && <div className="map-review map-status-notice" role="status">
                   <span>{developmentReady
-                    ? `Approved map revision ${mapRevision}. Define and confirm a target, goal, and completion criteria before starting development.`
-                    : 'Development-unit definition is locked until this map revision has an approved design draft.'}</span>
+                    ? `Approved map revision ${mapRevision}. Plan work as tickets in the Tickets tab; the map is shared context for you and the Agent.`
+                    : 'Development is locked until this map revision has an approved design draft.'}</span>
                   <button type="button" className="map-status-dismiss" aria-label="Dismiss map status notice" onClick={() => setMapStatusDismissed(true)}><X size={16} /></button>
                 </div>}
                 <div className="chat-messages" aria-live="polite">
@@ -1384,18 +1254,36 @@ function App() {
                     aria-label="Message the selected project component"
                     value={draft}
                     rows={1}
-                    placeholder={!project ? 'Choose a project folder to start chatting' : showChatStarter ? '만들고 싶은 것을 편하게 설명해 주세요' : mapDirty ? 'Save map edits as a draft before chatting…' : draftReviewActive ? 'Ask the Agent to revise the saved draft…' : nodes.length > 0 ? developmentReady ? unansweredQuestions(activeNodeData as ComponentData).length > 0 ? 'Answer the open question in Details to unlock development…' : `Request development for ${activeNodeData?.title ?? 'the selected node'}…` : 'Approve the map before requesting development…' : `Message ${activeNodeData?.title ?? 'the project'}... (⌘ ↵ to send)`}
-                    disabled={!project || !agentVersion || agentRunning || recommendationIsLoading || initialDesignPending || reviewingMap || draftEditDirty || mapProposals.length > 0 || !!reviewError || (nodes.length > 0 && (!developmentReady || !selectedNode))}
+                    placeholder={!project ? 'Choose a project folder to start chatting' : showChatStarter ? '만들고 싶은 것을 편하게 설명해 주세요' : mapDirty ? 'Save map edits as a draft before chatting…' : draftReviewActive ? 'Ask the Agent to revise the saved draft…' : nodes.length > 0 ? developmentReady ? unansweredQuestions(activeNodeData as ComponentData).length > 0 ? 'Answer the open question in Details before developing tickets that touch this node…' : `Discuss ${activeNodeData?.title ?? 'the selected node'} with the Agent…` : 'Approve the map before discussing development…' : `Message ${activeNodeData?.title ?? 'the project'}... (⌘ ↵ to send)`}
+                    disabled={!project || !agentVersion || agentRunning || initialDesignPending || reviewingMap || draftEditDirty || mapProposals.length > 0 || !!reviewError || (nodes.length > 0 && (!developmentReady || !selectedNode))}
                     onChange={(event) => setDraft(event.target.value)}
                     onKeyDown={handleComposerKeyDown}
                   />
-                  <button className="send-button" type="submit" disabled={!draft.trim() || !project || !agentVersion || agentRunning || recommendationIsLoading || initialDesignPending || reviewingMap || draftEditDirty || mapProposals.length > 0 || !!reviewError || (nodes.length > 0 && (!developmentReady || !selectedNode))} aria-label={agentRunning || initialDesignPending ? 'Generating design map' : draftReviewActive ? 'Request design draft revision' : nodes.length > 0 ? 'Request development for selected map node' : 'Send message'}>
+                  <button className="send-button" type="submit" disabled={!draft.trim() || !project || !agentVersion || agentRunning || initialDesignPending || reviewingMap || draftEditDirty || mapProposals.length > 0 || !!reviewError || (nodes.length > 0 && (!developmentReady || !selectedNode))} aria-label={agentRunning || initialDesignPending ? 'Generating design map' : draftReviewActive ? 'Request design draft revision' : nodes.length > 0 ? 'Discuss the selected map node' : 'Send message'}>
                     {agentRunning || initialDesignPending ? <LoaderCircle className="send-spinner" size={17} /> : <Send size={17} />}
                   </button>
                 </form>
               </div>
             )}
 
+
+            {!isChatStart && activeWorkspaceTab === 'tickets' && <TicketBoard
+              board={ticketBoard}
+              nodes={nodes}
+              busy={ticketBusy || projectBusy}
+              developBlockedReason={developBlockedReason}
+              planBlockedReason={planBlockedReason}
+              planningFeatureId={planningFeatureId}
+              expandedTicketId={expandedTicketId}
+              newTicketRequest={newTicketRequest}
+              review={runReview}
+              reviewLoading={runReviewLoading}
+              reviewError={runReviewError}
+              reviewSavingRunId={reviewSavingRunId}
+              reviewErrors={reviewErrors}
+              reviewNotes={reviewNotes}
+              actions={ticketActions}
+            />}
 
             {!isChatStart && activeWorkspaceTab === 'terminal' && (
               <div className="workspace-content terminal-content">
@@ -1481,40 +1369,8 @@ function App() {
                 <ul className="responsibility-list">
                   {activeNodeData.responsibilities.map((item) => <li key={item}>{item}</li>)}
                 </ul>
-                <section className="node-unit-plan" aria-label="Development unit for selected node">
-                  <div className="node-unit-plan-heading">
-                    <div><h3>Unit goal and completion criteria</h3><p>For {activeNodeData.title} · map revision {mapRevision}</p></div>
-                    {currentDevelopmentUnitSpec && <span>{currentDevelopmentUnitSpec.source === 'agent' ? 'AI-generated' : 'Edited'}</span>}
-                  </div>
-                  {developmentUnitSpecLoading === developmentUnitSpecKey && <p className="node-unit-plan-message" role="status">AI is preparing a focused development unit for this node…</p>}
-                  {!developmentReady && <p className="node-unit-plan-message">Approve the map before generating or editing a development unit.</p>}
-                  {developmentReady && mapDirty && <p className="node-unit-plan-message">Save these map edits as a draft and approve them before changing this node’s plan.</p>}
-                  {developmentReady && unansweredQuestions(activeNodeData).length > 0 && <p className="node-unit-plan-message">Answer this node’s open questions and approve the map before generating its plan.</p>}
-                  {!agentVersion && <p className="node-unit-plan-message">Connect to the Agent to generate this node’s plan.</p>}
-                  {developmentUnitSpecErrors[developmentUnitSpecKey] && <p className="node-unit-plan-error" role="alert">{developmentUnitSpecErrors[developmentUnitSpecKey]}</p>}
-                  {currentDevelopmentUnitSpec && <>
-                    <label>Unit goal
-                      <textarea rows={3} maxLength={4000} value={currentDevelopmentUnitSpec.goal} disabled={projectBusy || agentRunning || developmentUnitSpecSaving} onChange={(event) => {
-                        setDevelopmentUnitSpecs((current) => ({ ...current, [developmentUnitSpecKey]: { ...currentDevelopmentUnitSpec, goal: event.target.value } }))
-                        setDevelopmentUnitSpecDirty((current) => ({ ...current, [developmentUnitSpecKey]: true }))
-                      }} />
-                    </label>
-                    <label>Completion criteria (one per line)
-                      <textarea rows={4} maxLength={20000} value={currentDevelopmentUnitSpec.completionCriteria.join('\n')} disabled={projectBusy || agentRunning || developmentUnitSpecSaving} onChange={(event) => {
-                        const completionCriteria = event.target.value.split(/\r?\n/).map((criterion) => criterion.trim()).filter(Boolean)
-                        setDevelopmentUnitSpecs((current) => ({ ...current, [developmentUnitSpecKey]: { ...currentDevelopmentUnitSpec, completionCriteria } }))
-                        setDevelopmentUnitSpecDirty((current) => ({ ...current, [developmentUnitSpecKey]: true }))
-                      }} />
-                    </label>
-                    <div className="node-unit-plan-actions">
-                      <span>{currentUnitSpecDirty ? 'Unsaved edits' : 'Saved'}</span>
-                      {currentUnitSpecDirty && <button className="button button-outline" type="button" onClick={() => void saveSelectedDevelopmentUnitSpec()} disabled={developmentUnitSpecSaving || projectBusy || agentRunning || !currentDevelopmentUnitSpec.goal.trim() || currentDevelopmentUnitSpec.completionCriteria.length === 0 || currentDevelopmentUnitSpec.completionCriteria.length > 20 || currentDevelopmentUnitSpec.completionCriteria.some((criterion) => criterion.length > 1000)}>{developmentUnitSpecSaving ? 'Saving…' : 'Save plan'}</button>}
-                    </div>
-                    {currentDevelopmentUnitSpec.completionCriteria.length > 20 && <p className="node-unit-plan-error">A plan can have at most 20 completion criteria.</p>}
-                  </>}
-                  {!currentDevelopmentUnitSpec && !developmentUnitSpecLoading && developmentReady && !mapDirty && agentVersion && unansweredQuestions(activeNodeData).length === 0 && <button className="button button-outline" type="button" onClick={retryDevelopmentUnitSpec} disabled={projectBusy}>Generate plan again</button>}
-                  <p className="node-unit-plan-footer">Develop selected node saves any edits and starts this exact unit.</p>
-                </section>
+                <div className="relationships-heading"><h3>Tickets touching this node</h3><button type="button" className="text-action" onClick={() => setActiveDetailTab('tickets')}>View all</button></div>
+                <p className="muted-copy">{selectedNodeTickets.length === 0 ? 'No tickets yet. Nodes describe structure; work happens in tickets.' : `${selectedNodeTickets.filter((ticket) => ticket.status === 'todo').length} to do · ${selectedNodeTickets.filter((ticket) => ticket.status === 'in_progress').length} in progress · ${selectedNodeTickets.filter((ticket) => ticket.status === 'done').length} done`}</p>
                 <h3 className="section-heading-spaced">Details</h3>
                 <dl className="detail-facts">
                   <div><dt>Type</dt><dd><span className="type-pill">{activeNodeData.kind}</span></dd></div>
@@ -1536,49 +1392,15 @@ function App() {
               </div>
             )}
 
-            {!draftReviewActive && activeDetailTab === 'tasks' && (
+            {!draftReviewActive && activeDetailTab === 'tickets' && (
               <div className="detail-section">
-                <h3>Development units are separate from node responsibilities</h3>
-                {developmentUnits.length === 0
-                  ? <div className="detail-empty"><ListChecks size={20} /><strong>No development units yet</strong><p>Select a map node to see its AI-generated unit plan, then develop that node.</p></div>
-                  : developmentUnits.map((unit) => {
-                    const unitNode = nodes.find((node) => node.id === unit.nodeId && node.type === 'component')
-                    const statusLabel = unit.reviewDecision
-                      ? developmentReviewDecisionLabels[unit.reviewDecision]
-                      : unit.status === 'started' ? 'Started' : unit.status === 'start_failed' ? 'Could not start' : 'Confirmed'
-                    const runStateLabel = unit.latestRunState === 'finished' ? unit.reviewDecision ? 'Run finished' : 'Run finished · awaiting review' : unit.latestRunState === 'interrupted' ? 'Run interrupted' : unit.latestRunState === 'failed' ? 'Run failed' : unit.latestRunState === 'disconnected' ? 'Agent disconnected' : unit.latestRunState === 'start_failed' ? 'Run could not start' : unit.latestRunState === 'running' ? 'Agent running' : unit.latestRunState === 'starting' ? 'Agent starting' : null
-                    const runStartedAt = unit.latestRunStartedAt ?? unit.startedAt ?? unit.createdAt
-                    const runStartedAtLabel = formatPersistedTimestamp(runStartedAt) ?? 'time unavailable'
-                    const runFinishedAtLabel = formatPersistedTimestamp(unit.latestRunFinishedAt)
-                    const runDuration = formatRunDuration(runStartedAt, unit.latestRunFinishedAt)
-                    return <article className="detail-task development-unit-card" key={unit.id}>
-                      <ListChecks size={17} />
-                      <div>
-                        <strong>{unit.goal}</strong>
-                        <small>{unitNode?.type === 'component' ? unitNode.data.title : unit.nodeId} · map revision {unit.mapRevision} · {statusLabel}{unit.latestRunId ? ` · run #${unit.latestRunId}` : ''}{runStateLabel ? ` · ${runStateLabel}` : ''}</small>
-                        <small className="development-run-timestamp">
-                          {unit.latestRunId
-                            ? <>Started {runStartedAtLabel}{unit.latestRunFinishedAt && <> · Finished {runFinishedAtLabel}{runDuration ? ` · ${runDuration}` : ''}</>}</>
-                            : <>Created {formatPersistedTimestamp(unit.createdAt) ?? 'time unavailable'}</>}
-                        </small>
-                        <ul>{unit.completionCriteria.map((criterion) => <li key={criterion}>{criterion}</li>)}</ul>
-                        {unit.statusDetail && <small role="alert">{unit.statusDetail}</small>}
-                        {unit.latestRunDetail && <small role="alert">{unit.latestRunDetail}</small>}
-                        {unit.latestRunId && <DevelopmentRunReviewPanel
-                          unit={unit}
-                          review={developmentRunReview?.runId === unit.latestRunId ? developmentRunReview : null}
-                          loading={developmentRunReviewLoading === unit.latestRunId}
-                          error={developmentRunReviewError?.runId === unit.latestRunId ? developmentRunReviewError.message : null}
-                          decisionNote={developmentReviewNotes[unit.latestRunId] ?? unit.reviewNote ?? ''}
-                          decisionSaving={developmentReviewSavingRunId === unit.latestRunId}
-                          decisionError={developmentReviewErrors[unit.latestRunId] ?? null}
-                          onDecisionNoteChange={(note) => setDevelopmentReviewNotes((current) => ({ ...current, [unit.latestRunId!]: note }))}
-                          onSaveDecision={(decision, note) => { void saveDevelopmentReview(unit, decision, note) }}
-                          onToggle={() => { void toggleDevelopmentRunReview(unit.latestRunId!) }}
-                        />}
-                      </div>
-                    </article>
-                  })}
+                <h3>Tickets touching {activeNodeData?.title ?? 'this node'}</h3>
+                <NodeTicketList
+                  tickets={selectedNodeTickets}
+                  onOpen={openTicket}
+                  onCreate={() => { if (selectedNode) requestTicketForNode(selectedNode.id) }}
+                  canCreate={!!selectedNode && !ticketBusy && !projectBusy}
+                />
               </div>
             )}
 

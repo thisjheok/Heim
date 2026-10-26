@@ -23,6 +23,7 @@ Heim — 프로젝트 지도(노드 그래프)를 설계·승인하고 Codex CLI
 - `app/src-tauri/src/lib.rs` — DB, Tauri 명령, `generate_handler!` 등록
 - `app/src-tauri/src/agent.rs` — Codex `app-server` 실행·세션·JSON 계약
 - `app/src-tauri/src/map_proposals.rs` — 지도 변경 초안(proposal)
+- `app/src-tauri/src/tickets.rs` — 기능·티켓·실행·검토 DB 로직 / UI: `app/src/TicketBoard.tsx`, 타입 `app/src/data/tickets.ts`
 - `app/src-tauri/capabilities/default.json` — Tauri 권한
 - `ui-test-existing-project/` — "기존 프로젝트 열기" 테스트용 픽스처 (앱 코드 아님)
 - `Heim-verification-artifacts/` — 단계별 수동 검증 기록
@@ -33,7 +34,8 @@ Heim — 프로젝트 지도(노드 그래프)를 설계·승인하고 Codex CLI
 ## 규칙
 - 지도 승인 상태(초안/확정)와 노드 구현 상태는 별개. 지도 변경은 반드시 초안 → 사용자 승인으로만 확정.
 - Agent가 노드 상태를 자동으로 덮어쓰지 않는다.
-- Agent 응답은 JSON 계약 `contractVersion: 1` 형식 유지 (`Heim-development-plan.md` 참고). 바꾸면 버전을 올린다.
+- 노드(지도)와 티켓(개발 단위)은 분리 — 진행 상태는 티켓에만 둔다. next 티켓은 LLM 없이 순서로 결정 (docs/decisions/0001).
+- Agent 응답은 JSON 계약 `contractVersion: 2` 형식 유지 (`Heim-development-plan.md` 참고). 바꾸면 버전을 올린다.
 - AI 제공자는 Codex CLI뿐 (API 키/.env 불필요). Heim은 자체 샌드박싱 없이 Codex 설정을 따른다.
 - 커밋: `feat:` / `fix:` / `add:` + 짧은 영어 제목. 상세는 `.gjc/skills/git-commit/SKILL.md`.
 - `README.md` ↔ `README.ko.md`는 쌍. 하나를 고치면 다른 쪽도 맞춘다.

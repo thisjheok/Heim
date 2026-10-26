@@ -656,12 +656,12 @@ fn parse_design_response(
     let envelope: Value = serde_json::from_str(response.trim())
         .map_err(|error| format!("Agent response was not JSON: {error}"))?;
     let context = &envelope["context"];
-    if envelope["contractVersion"] != 1
+    if envelope["contractVersion"] != agent::CONTRACT_VERSION
         || envelope["mode"] != "design"
         || context["mapRevision"].as_i64() != Some(expected_revision)
         || context["draftId"].as_i64() != expected_draft_id
         || context["draftVersion"].as_i64() != expected_draft_version
-        || !context["unitId"].is_null()
+        || !context["ticketId"].is_null()
         || envelope.pointer("/result/kind").and_then(Value::as_str) != Some("map_draft")
         || envelope
             .pointer("/result/message")
@@ -1499,9 +1499,9 @@ mod tests {
     #[test]
     fn design_response_requires_responsibilities_and_typed_edges() {
         let response = json!({
-            "contractVersion":1,
+            "contractVersion":2,
             "mode":"design",
-            "context":{"mapRevision":0,"draftId":null,"draftVersion":null,"unitId":null},
+            "context":{"mapRevision":0,"draftId":null,"draftVersion":null,"ticketId":null},
             "result":{"kind":"map_draft","message":"Proposed a notes architecture.","draft":{
                 "goal":"Build a note app",
                 "nodes":[
@@ -1527,6 +1527,10 @@ mod tests {
         let invalid_response = response.replace("depends_on", "related");
         assert!(parse_design_response(&invalid_response, 0, None, None).is_err());
         assert!(parse_design_response(&response, 1, None, None).is_err());
+        let v1_response = response
+            .replace("\"contractVersion\":2", "\"contractVersion\":1")
+            .replace("\"ticketId\":null", "\"unitId\":null");
+        assert!(parse_design_response(&v1_response, 0, None, None).is_err());
     }
 
     #[test]

@@ -337,7 +337,7 @@ fn validate_agent_response(
 
 /// Agent JSON contract version. v2: tickets replace development units (`ticketId`,
 /// `ticket_plan`) and the LLM next-node recommendation was removed.
-const CONTRACT_VERSION: i64 = 2;
+pub(crate) const CONTRACT_VERSION: i64 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AgentMode {

@@ -23,7 +23,8 @@ export type DecisionQuestion = {
 
 export type ComponentData = {
   title: string
-  nextRecommendationRationale?: string
+  /** Display-only overlay derived from tickets; never persisted with the map. */
+  ticketSummary?: { open: number; active: number; done: number; next: boolean }
   kind: string
   summary: string
   technology: string

@@ -7,6 +7,7 @@ use tauri::Manager;
 
 mod agent;
 mod map_proposals;
+mod profile;
 mod tickets;
 
 #[derive(Serialize)]
@@ -85,6 +86,11 @@ const SCHEMA: &str = "
     DROP TABLE IF EXISTS development_unit_specs;
     DROP TABLE IF EXISTS development_unit_runs;
     DROP TABLE IF EXISTS development_units;
+    CREATE TABLE IF NOT EXISTS project_profiles (
+        project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+        profile TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
     CREATE TABLE IF NOT EXISTS features (
         id INTEGER PRIMARY KEY,
         project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -434,6 +440,9 @@ struct DesignDraft {
     edges: Vec<Value>,
     questions: Vec<String>,
     assumptions: Vec<String>,
+    /// Absent on drafts that only edit the map; approval then keeps the confirmed profile.
+    #[serde(default)]
+    profile: Option<profile::ProjectProfile>,
 }
 
 #[derive(Serialize)]
@@ -528,6 +537,9 @@ fn validate_design_draft(draft: &DesignDraft) -> Result<(), String> {
     {
         return Err("Draft questions and assumptions must contain 1-4000 characters".into());
     }
+    if let Some(profile) = &draft.profile {
+        profile::validate_profile(profile)?;
+    }
     validate_map(&draft.nodes, &draft.edges)
 }
 
@@ -571,6 +583,7 @@ fn persist_map_edit_draft(
         edges: map.edges,
         questions: Vec::new(),
         assumptions: Vec::new(),
+        profile: None,
     };
     validate_design_draft(&draft)?;
     let serialized = serde_json::to_string(&draft).map_err(|error| error.to_string())?;
@@ -816,6 +829,11 @@ fn parse_design_response(
         edges,
         questions: strings("questions")?,
         assumptions: strings("assumptions")?,
+        profile: Some(profile::parse_profile(
+            value
+                .get("profile")
+                .ok_or("Draft project profile is missing")?,
+        )?),
     };
     validate_design_draft(&draft)?;
     Ok(draft)
@@ -1026,6 +1044,9 @@ fn resolve_design_draft_in_db(
     if updated_draft != 1 {
         return Err("Design draft changed before approval could be committed".into());
     }
+    if let Some(profile) = &draft.profile {
+        profile::store_project_profile(&tx, project_id, profile)?;
+    }
     tx.commit().map_err(|error| error.to_string())?;
     Ok(Some(ProjectMap {
         nodes: draft.nodes,
@@ -1199,6 +1220,7 @@ pub fn run() {
             create_design_draft,
             pending_design_draft,
             development_ready,
+            profile::project_profile,
             tickets::project_ticket_board,
             tickets::create_feature,
             tickets::update_feature,
@@ -1295,6 +1317,7 @@ mod tests {
             edges: vec![],
             questions: vec![],
             assumptions: vec![],
+            profile: None,
         };
         assert!(validate_design_draft(&draft).is_ok());
         draft.edges.push(
@@ -1332,6 +1355,7 @@ mod tests {
             edges: vec![],
             questions: vec![],
             assumptions: vec![],
+            profile: None,
         };
         assert!(validate_design_draft(&draft).is_ok());
 
@@ -1384,6 +1408,7 @@ mod tests {
             edges: initial.edges.clone(),
             questions: vec![],
             assumptions: vec![],
+            profile: None,
         };
         conn.execute(
             "INSERT INTO design_drafts (project_id, base_revision, version, draft, state) VALUES (1, 0, 1, ?1, 'accepted')",
@@ -1470,6 +1495,7 @@ mod tests {
             edges: vec![],
             questions: vec![],
             assumptions: vec![],
+            profile: None,
         };
         conn.execute(
             "INSERT INTO design_drafts (project_id, base_revision, version, draft, state) VALUES (1, ?1, 2, ?2, 'pending')",
@@ -1499,7 +1525,7 @@ mod tests {
     #[test]
     fn design_response_requires_responsibilities_and_typed_edges() {
         let response = json!({
-            "contractVersion":2,
+            "contractVersion":4,
             "mode":"design",
             "context":{"mapRevision":0,"draftId":null,"draftVersion":null,"ticketId":null},
             "result":{"kind":"map_draft","message":"Proposed a notes architecture.","draft":{
@@ -1510,10 +1536,20 @@ mod tests {
                 ],
                 "edges":[{"id":"notes-storage","source":"notes","target":"storage","relation":"depends_on"}],
                 "questions":[],
-                "assumptions":[]
+                "assumptions":[],
+                "profile":{"outputForm":"Web frontend","stack":[{"area":"Frontend","items":["React","TypeScript"]}],"constraints":[],"source":"ai_proposed","rationale":"Notes are used in the browser."}
             }}
         }).to_string();
         let draft = parse_design_response(&response, 0, None, None).unwrap();
+        let stack = &draft.profile.as_ref().unwrap().stack;
+        assert_eq!(stack[0].area, "Frontend");
+        assert_eq!(stack[0].items, ["React", "TypeScript"]);
+        let mut without_profile: Value = serde_json::from_str(&response).unwrap();
+        without_profile["result"]["draft"]
+            .as_object_mut()
+            .unwrap()
+            .remove("profile");
+        assert!(parse_design_response(&without_profile.to_string(), 0, None, None).is_err());
         assert_eq!(
             draft.nodes[0]["data"]["responsibilities"][0],
             "Create and edit notes"
@@ -1528,7 +1564,7 @@ mod tests {
         assert!(parse_design_response(&invalid_response, 0, None, None).is_err());
         assert!(parse_design_response(&response, 1, None, None).is_err());
         let v1_response = response
-            .replace("\"contractVersion\":2", "\"contractVersion\":1")
+            .replace("\"contractVersion\":4", "\"contractVersion\":1")
             .replace("\"ticketId\":null", "\"unitId\":null");
         assert!(parse_design_response(&v1_response, 0, None, None).is_err());
     }
@@ -1555,6 +1591,7 @@ mod tests {
             edges: vec![],
             questions: vec![],
             assumptions: vec![],
+            profile: None,
         };
         conn.execute("INSERT INTO design_drafts (project_id, base_revision, version, draft) VALUES (1, 0, 1, ?1)", [serde_json::to_string(&draft).unwrap()]).unwrap();
         let (nodes, revision): (String, i64) = conn
@@ -1603,6 +1640,7 @@ mod tests {
             edges: vec![],
             questions: vec![],
             assumptions: vec![],
+            profile: None,
         };
         conn.execute("INSERT INTO design_drafts (project_id, base_revision, version, draft) VALUES (1, 0, 1, ?1)", [serde_json::to_string(&draft).unwrap()]).unwrap();
         let id = conn.last_insert_rowid();
@@ -1661,6 +1699,7 @@ mod tests {
             edges: vec![],
             questions: vec![],
             assumptions: vec![],
+            profile: None,
         };
         conn.execute("INSERT INTO design_drafts (id, project_id, base_revision, version, draft) VALUES (7, 1, 0, 3, ?1)", [serde_json::to_string(&draft).unwrap()]).unwrap();
         let accepted = resolve_design_draft_in_db(&mut conn, 1, 7, 3, true)
@@ -1690,6 +1729,8 @@ mod tests {
         );
         assert!(has_current_approved_map(&conn, 1).unwrap());
         assert!(resolve_design_draft_in_db(&mut conn, 1, 7, 3, true).is_err());
+        // A draft without a profile (map edits, legacy drafts) leaves the profile unset.
+        assert_eq!(profile::load_project_profile(&conn, 1).unwrap(), None);
         save_map(
             &conn,
             1,
@@ -1701,6 +1742,67 @@ mod tests {
         )
         .unwrap();
         assert!(has_current_approved_map(&conn, 1).unwrap());
+    }
+
+    #[test]
+    fn approving_a_draft_confirms_its_profile_and_map_edits_keep_it() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let root = canonical_project(&std::env::current_dir().unwrap()).unwrap();
+        conn.execute(
+            "INSERT INTO projects (id, name, root) VALUES (1, 'test', ?1)",
+            [&root],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO project_maps (project_id) VALUES (1)", [])
+            .unwrap();
+        let shop_profile = profile::ProjectProfile {
+            output_form: "Web frontend (single-page app in the browser)".into(),
+            stack: vec![profile::StackArea {
+                area: "Frontend".into(),
+                items: vec!["React".into(), "TypeScript".into(), "Vite".into()],
+            }],
+            constraints: vec![],
+            source: "ai_proposed".into(),
+            rationale: "A shop is browsed in a web browser.".into(),
+        };
+        let draft = DesignDraft {
+            goal: "Build a shop".into(),
+            nodes: sample_map().nodes,
+            edges: vec![],
+            questions: vec![],
+            assumptions: vec![],
+            profile: Some(shop_profile.clone()),
+        };
+        conn.execute(
+            "INSERT INTO design_drafts (id, project_id, base_revision, version, draft) VALUES (1, 1, 0, 1, ?1)",
+            [serde_json::to_string(&draft).unwrap()],
+        )
+        .unwrap();
+        // Rejected or pending drafts never confirm a profile.
+        assert_eq!(profile::load_project_profile(&conn, 1).unwrap(), None);
+        let accepted = resolve_design_draft_in_db(&mut conn, 1, 1, 1, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            profile::load_project_profile(&conn, 1).unwrap(),
+            Some(shop_profile.clone())
+        );
+
+        let edit = persist_map_edit_draft(&mut conn, 1, accepted).unwrap();
+        assert!(edit.draft.draft.profile.is_none());
+        resolve_design_draft_in_db(&mut conn, 1, edit.draft.id, edit.draft.version, true).unwrap();
+        assert_eq!(
+            profile::load_project_profile(&conn, 1).unwrap(),
+            Some(shop_profile)
+        );
+
+        let legacy: DesignDraft = serde_json::from_str(
+            r#"{"goal":"Old","nodes":[],"edges":[],"questions":[],"assumptions":[]}"#,
+        )
+        .unwrap();
+        assert!(legacy.profile.is_none());
     }
 
     #[test]
@@ -1724,6 +1826,7 @@ mod tests {
             edges: vec![],
             questions: vec![],
             assumptions: vec![],
+            profile: None,
         };
         conn.execute("INSERT INTO design_drafts (id, project_id, base_revision, version, draft) VALUES (7, 1, 0, 1, ?1)", [serde_json::to_string(&draft).unwrap()]).unwrap();
         assert!(

@@ -31,6 +31,7 @@ import {
   FolderOpen,
   FolderPlus,
   GitBranch,
+  Layers,
   LayoutGrid,
   Link2,
   LoaderCircle,
@@ -62,6 +63,8 @@ import {
 import { QuestionnairePanel } from './QuestionnairePanel'
 import { DemoWorkspace } from './DemoWorkspace'
 import { NodeTicketList, TicketBoard, type TicketBoardActions } from './TicketBoard'
+import { ProjectStackPanel, StackAreaList } from './ProjectStack'
+import { draftProfileSourceLabels, stackAreaSummary, type ProjectProfile } from './data/profile'
 import {
   emptyTicketBoard,
   ticketIsRunning,
@@ -78,7 +81,7 @@ import './App.css'
 
 type ComponentFlowNode = Node<ComponentData, 'component'>
 type LayerFlowNode = Node<LayerData, 'layer'>
-type WorkspaceTab = 'chat' | 'tickets' | 'terminal'
+type WorkspaceTab = 'chat' | 'tickets' | 'stack' | 'terminal'
 type DetailTab = 'overview' | 'files' | 'tickets' | 'relationships'
 type ChatMessage = { id: string; text: string; time: string; role: 'user' | 'agent' | 'status' }
 type AgentEvent = { projectId: number; kind: 'delta' | 'message' | 'status' | 'protocol_error' | 'files' | 'changed' | 'done' | 'disconnected' | 'approval'; text: string; itemId?: string; requestId?: number }
@@ -91,12 +94,13 @@ type MapProposal = { id: number; projectId: number; baseRevision: number; change
 type RuntimeInfo = { version: string; platform: string }
 type Project = { id: number; name: string; root: string }
 type StoredMap = { nodes: HeimNode[]; edges: HeimEdge[]; revision: number }
-type DesignDraft = { id: number; projectId: number; baseRevision: number; version: number; draft: { goal: string; nodes: HeimNode[]; edges: HeimEdge[]; questions: string[]; assumptions: string[] } }
+type DesignDraft = { id: number; projectId: number; baseRevision: number; version: number; draft: { goal: string; nodes: HeimNode[]; edges: HeimEdge[]; questions: string[]; assumptions: string[]; profile?: ProjectProfile | null } }
 type MapEditDraftResult = { draft: DesignDraft; confirmedMap: StoredMap }
 type BackendStatus =
   | { kind: 'checking' | 'browser' }
   | { kind: 'ready'; info: RuntimeInfo }
   | { kind: 'error'; message: string }
+
 
 const componentTitle = (nodes: HeimNode[], id: string) => {
   const node = nodes.find((item) => item.id === id)
@@ -170,6 +174,7 @@ const nodeTypes = {
 const workspaceTabs: { id: WorkspaceTab; label: string; icon: LucideIcon }[] = [
   { id: 'chat', label: 'Chat', icon: MessageCircle },
   { id: 'tickets', label: 'Tickets', icon: ListChecks },
+  { id: 'stack', label: 'Stack', icon: Layers },
   { id: 'terminal', label: 'Terminal', icon: SquareTerminal },
 ]
 
@@ -203,6 +208,7 @@ function App() {
   const [draftSelectedNodeId, setDraftSelectedNodeId] = useState('')
   const [draftSelectedPane, setDraftSelectedPane] = useState<'before' | 'after'>('after')
   const [developmentReady, setDevelopmentReady] = useState(false)
+  const [projectProfile, setProjectProfile] = useState<ProjectProfile | null>(null)
   const [ticketBoard, setTicketBoard] = useState<TicketBoardData>(emptyTicketBoard)
   const [ticketBusy, setTicketBusy] = useState(false)
   const [planningFeatureId, setPlanningFeatureId] = useState<number | null>(null)
@@ -462,6 +468,7 @@ function App() {
     const map = await invoke<StoredMap>('load_project_map', { projectId: next.id })
     const pendingDraft = await invoke<DesignDraft | null>('pending_design_draft', { projectId: next.id })
     const canDevelop = await invoke<boolean>('development_ready', { projectId: next.id })
+    const profile = await invoke<ProjectProfile | null>('project_profile', { projectId: next.id })
     const board = await invoke<TicketBoardData>('project_ticket_board', { projectId: next.id })
     const hasContent = await invoke<boolean>('project_has_content', { projectId: next.id })
     setNodes(map.nodes)
@@ -476,6 +483,7 @@ function App() {
     setDraftSelectedPane('after')
     setDraftEditDirty(false)
     setDevelopmentReady(canDevelop)
+    setProjectProfile(profile)
     setTicketBoard(board)
     setExpandedTicketId(null)
     setNewTicketRequest(null)
@@ -620,6 +628,8 @@ function App() {
         mapDirtyRef.current = false
         setMapDirty(false)
         setDevelopmentReady(true)
+        // Approval confirms the draft's profile; drafts without one keep the current profile.
+        if (designDraft.draft.profile) setProjectProfile(designDraft.draft.profile)
       } else if (nodes.length === 0) {
         setDevelopmentReady(false)
       }
@@ -1190,7 +1200,10 @@ function App() {
                 {nodes.length > 0 && !mapStatusDismissed && <div className="map-review map-status-notice" role="status">
                   <span>{developmentReady
                     ? `Approved map revision ${mapRevision}. Plan work as tickets in the Tickets tab; the map is shared context for you and the Agent.`
-                    : 'Development is locked until this map revision has an approved design draft.'}</span>
+                    : 'Development is locked until this map revision has an approved design draft.'}
+                    {' '}{projectProfile
+                      ? <>Building: <strong>{projectProfile.outputForm}</strong> ({stackAreaSummary(projectProfile)}). See the Stack tab for details.</>
+                      : 'No confirmed output form or stack yet: the Agent follows the existing code, and reports a blocker instead of choosing one in an empty folder.'}</span>
                   <button type="button" className="map-status-dismiss" aria-label="Dismiss map status notice" onClick={() => setMapStatusDismissed(true)}><X size={16} /></button>
                 </div>}
                 <div className="chat-messages" aria-live="polite">
@@ -1212,9 +1225,38 @@ function App() {
                 {designDraft && <div className="map-review" aria-label="Saved design draft">
                   <strong>Unconfirmed design draft · v{designDraft.version}</strong>
                   <p>{designDraft.draft.goal}</p>
-                  <span>{designDraft.draft.nodes.length} planned nodes · {designDraft.draft.edges.length} relationships · base map revision {designDraft.baseRevision}</span>
-                  {designDraft.draft.questions.map((question, index) => <small key={`q-${index}`}>Question: {question}</small>)}
-                  {designDraft.draft.assumptions.map((assumption, index) => <small key={`a-${index}`}>Assumption: {assumption}</small>)}
+                  <span className="draft-summary-meta">{designDraft.draft.nodes.length} planned nodes · {designDraft.draft.edges.length} relationships · base map revision {designDraft.baseRevision}</span>
+                  {designDraft.draft.profile
+                    ? <section className="draft-profile" aria-label="Output and stack">
+                      <span className="draft-summary-label">Output and stack</span>
+                      <strong>{designDraft.draft.profile.outputForm}</strong>
+                      <span className={`draft-profile-source is-${designDraft.draft.profile.source}`}>{draftProfileSourceLabels[designDraft.draft.profile.source]}</span>
+                      <StackAreaList stack={designDraft.draft.profile.stack} />
+                      {designDraft.draft.profile.constraints.length > 0 && <div className="draft-profile-group" aria-label="Constraints">
+                        <span className="draft-summary-label">Constraints</span>
+                        <ul className="draft-summary-list">
+                          {designDraft.draft.profile.constraints.map((constraint) => <li key={constraint}>{constraint}</li>)}
+                        </ul>
+                      </div>}
+                      {designDraft.draft.profile.rationale && <details className="draft-summary-details">
+                        <summary>Why this stack</summary>
+                        <p>{designDraft.draft.profile.rationale}</p>
+                      </details>}
+                      <p className="draft-summary-note">Approving the map also confirms this output form and stack for every ticket.</p>
+                    </section>
+                    : projectProfile && <p className="draft-summary-note">Keeps the confirmed stack: {projectProfile.outputForm} ({stackAreaSummary(projectProfile)})</p>}
+                  {designDraft.draft.questions.length > 0 && <section className="draft-summary-section" aria-label="Open questions">
+                    <span className="draft-summary-label">Questions ({designDraft.draft.questions.length})</span>
+                    <ul className="draft-summary-list">
+                      {designDraft.draft.questions.map((question, index) => <li key={`q-${index}`}>{question}</li>)}
+                    </ul>
+                  </section>}
+                  {designDraft.draft.assumptions.length > 0 && <details className="draft-summary-details">
+                    <summary>Assumptions ({designDraft.draft.assumptions.length})</summary>
+                    <ul className="draft-summary-list">
+                      {designDraft.draft.assumptions.map((assumption, index) => <li key={`a-${index}`}>{assumption}</li>)}
+                    </ul>
+                  </details>}
                 </div>}
                 {draftReviewActive && draftEditDirty && <div className="map-review" role="status">Save your direct After edits before asking the Agent to revise the draft.</div>}
                 {reviewingMap && <div className="map-review" role="status">Agent is comparing the changed code with the project map…</div>}
@@ -1284,6 +1326,8 @@ function App() {
               reviewNotes={reviewNotes}
               actions={ticketActions}
             />}
+
+            {!isChatStart && activeWorkspaceTab === 'stack' && <ProjectStackPanel profile={projectProfile} />}
 
             {!isChatStart && activeWorkspaceTab === 'terminal' && (
               <div className="workspace-content terminal-content">

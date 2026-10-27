@@ -46,7 +46,9 @@ Heim의 채팅 UI가 Agent CLI의 대화 화면이다. 사용자는 이 화면�
 | 4 | Heim–Agent 소통 규약을 모드별로 적용하고, 백엔드가 기준 지도·초안·개발 단위에서 맥락을 구성해 구조화된 결과를 받음 | 완료 — 모드별 권한·기준 맥락 및 버전 지정 응답 계약을 정의·검증. 응답의 장기 저장과 검토 후 반영은 5번 작업 |
 | 5 | Agent 결과·변경 파일·검증 근거를 개발 단위에 연결하고, 검토 후에만 구현·검증 상태와 지도 변경을 반영 | 완료 |
 
-**4번 응답 계약 (`contractVersion: 2`)**
+**4번 응답 계약 (`contractVersion: 4`)**
+- **v4 (2026-10-27, ADR 0002):** `profile.stack`을 영역별 묶음 `[{area, items[]}]`로 바꿨다. 영역 이름은 Agent가 자유롭게 정한다(단일 스택이면 영역 하나). v3 때 저장된 평평한 목록은 읽을 때 `Stack` 영역 하나로 해석한다. 확정 사양은 하단 작업 영역의 Stack 탭에 표시된다.
+- **v3 (2026-10-26, ADR 0002):** `map_draft`의 `draft`에 필수 `profile`(`outputForm`, `stack[]`, `constraints[]`, `source`(user_specified/detected/ai_proposed), `rationale`)을 추가했다. 초안 승인 때 `project_profiles`에 확정되고, 설계 맥락·티켓 분해·티켓 개발 프롬프트에 항상 들어간다.
 - **v2 (2026-10-26, ADR 0001):** `context.unitId`를 `ticketId`로, `unit_plan`을 `ticket_plan`(`featureId`, `tickets[{title, goal, completionCriteria, nodeIds}]`, nodeIds는 확정 지도의 노드만)으로 바꾸고 `next_development_node`를 제거했다. 실행 기록 테이블은 `ticket_runs`, `ticket_run_reports`, `ticket_run_evidence`, `ticket_reviews`로 대체했다. 아래 5번 하위 단위 기록의 `development_unit_*` 이름은 v1 당시의 것이다.
 - 공통 외피는 `{ contractVersion, mode, context, result }`다. `context`에는 `mapRevision`, `draftId`, `draftVersion`, `ticketId`를 모두 넣으며, 해당하지 않는 ID는 `null`이다. Heim은 요청 스냅샷과 정확히 일치하는지 확인한다.
 - 설계 대화는 `result.kind = discussion`과 `message`, `questions`, `assumptions`를 반환한다. 지도 생성·수정은 `result.kind = map_draft`와 `message`, `draft` 전체를 반환한다. 초안 생성·수정은 디자인 초안의 필드·노드·관계 검증도 통과해야 한다.

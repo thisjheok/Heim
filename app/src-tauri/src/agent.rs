@@ -22,6 +22,7 @@ use tokio::{
 
 use crate::{
     database, ensure_project,
+    profile::{PROFILE_DRAFT_RULES, load_project_profile, profile_prompt_section},
     tickets::{
         TicketInput, begin_ticket_run, feature_plan_context, record_ticket_run_evidence,
         save_ticket_run_report, store_planned_tickets, transition_ticket_run,
@@ -143,6 +144,7 @@ fn validate_agent_response(
                 || !result["draft"]["edges"].is_array()
                 || !result["draft"]["questions"].is_array()
                 || !result["draft"]["assumptions"].is_array()
+                || !result["draft"]["profile"].is_object()
             {
                 return Err("Structured map draft payload is incomplete".into());
             }
@@ -336,8 +338,10 @@ fn validate_agent_response(
 }
 
 /// Agent JSON contract version. v2: tickets replace development units (`ticketId`,
-/// `ticket_plan`) and the LLM next-node recommendation was removed.
-pub(crate) const CONTRACT_VERSION: i64 = 2;
+/// `ticket_plan`) and the LLM next-node recommendation was removed. v3: map drafts carry
+/// a required project `profile` (output form and stack). v4: `profile.stack` is grouped
+/// into freely named areas (`[{area, items}]`).
+pub(crate) const CONTRACT_VERSION: i64 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AgentMode {
@@ -1264,11 +1268,13 @@ pub(crate) fn design_context(
             "edges": serde_json::from_str::<Value>(&edges_json).map_err(|error| error.to_string())?,
         },
         "pendingDraft": draft,
+        "confirmedProfile": load_project_profile(conn, project_id)?,
         "rules": [
             "The confirmed map is authoritative at the stated revision.",
             "A pending draft is unconfirmed and must never be described as the confirmed map.",
             "Do not use unsaved UI state; only the persisted map and draft above are available.",
             "This is design-only context. Do not modify project files or perform implementation work.",
+            "The confirmed profile fixes the project's output form and stack; suggest changing it only when the user asks.",
         ],
     }))
     .map_err(|error| error.to_string())?;
@@ -1377,6 +1383,7 @@ pub async fn start_ticket_development(
     {
         return Err("Finish or cancel the current agent turn before starting development".into());
     }
+    let profile = load_project_profile(&conn, project_id)?;
     let ticket = begin_ticket_run(&mut conn, project_id, ticket_id)?;
     let run_id = ticket.run_id;
     let criteria = ticket
@@ -1386,7 +1393,7 @@ pub async fn start_ticket_development(
         .collect::<Vec<_>>()
         .join("\n");
     let prompt = format!(
-        "HEIM MODE: DEVELOPMENT. Return exactly one JSON object as your final response, without markdown, using this contract: {{\"contractVersion\":2,\"mode\":\"development\",\"context\":{{\"mapRevision\":{revision},\"draftId\":null,\"draftVersion\":null,\"ticketId\":{id}}},\"result\":{{\"kind\":\"development_report\",\"outcome\":\"completed\"|\"incomplete\"|\"blocked\",\"summary\":string,\"criteria\":[{{\"index\":number,\"status\":\"met\"|\"not_met\"|\"not_run\",\"evidence\":[string]}}],\"changes\":[{{\"path\":string,\"summary\":string}}],\"checks\":[{{\"command\":string,\"status\":\"passed\"|\"failed\"|\"not_run\",\"summary\":string}}],\"blockers\":[string]}}}}. Include exactly one criteria entry for each listed criterion, in the same order, using zero-based indexes. Report only checks actually run; your claims are not independent Heim verification. The user explicitly started ticket #{id}. Implement only this ticket's goal and completion criteria; do not pick up other work or continue after this ticket. Earlier work in any part of the project may be changed when this ticket requires it. The Heim project map below is shared context so you know where the work belongs and which boundaries and relationships to respect; it is not additional scope. Implement product behavior, not merely tests, fixtures, documentation, or a test harness. Tests may support verification after implementation. Do not alter the map or mark anything implemented/verified based on your response. Respect the existing Codex workspace-write sandbox and approval policy.\n\nTicket: {title}\n\nGoal:\n{goal}\n\nCompletion criteria:\n{criteria}\n\nMap nodes this ticket touches (approved map revision {revision}):\n{targets}\n{missing}\nNeighboring nodes (context only):\n{related}\n\nRelationships of the touched nodes, preserving source, target, and relation type (context only):\n{related_edges}\n\nWhole project map at a glance (context only):\n{overview}",
+        "HEIM MODE: DEVELOPMENT. Return exactly one JSON object as your final response, without markdown, using this contract: {{\"contractVersion\":4,\"mode\":\"development\",\"context\":{{\"mapRevision\":{revision},\"draftId\":null,\"draftVersion\":null,\"ticketId\":{id}}},\"result\":{{\"kind\":\"development_report\",\"outcome\":\"completed\"|\"incomplete\"|\"blocked\",\"summary\":string,\"criteria\":[{{\"index\":number,\"status\":\"met\"|\"not_met\"|\"not_run\",\"evidence\":[string]}}],\"changes\":[{{\"path\":string,\"summary\":string}}],\"checks\":[{{\"command\":string,\"status\":\"passed\"|\"failed\"|\"not_run\",\"summary\":string}}],\"blockers\":[string]}}}}. Include exactly one criteria entry for each listed criterion, in the same order, using zero-based indexes. Report only checks actually run; your claims are not independent Heim verification. The user explicitly started ticket #{id}. Implement only this ticket's goal and completion criteria; do not pick up other work or continue after this ticket. Earlier work in any part of the project may be changed when this ticket requires it. The Heim project map below is shared context so you know where the work belongs and which boundaries and relationships to respect; it is not additional scope. Implement product behavior, not merely tests, fixtures, documentation, or a test harness. Tests may support verification after implementation. Do not alter the map or mark anything implemented/verified based on your response. Respect the existing Codex workspace-write sandbox and approval policy.\n\n{profile}\n\nTicket: {title}\n\nGoal:\n{goal}\n\nCompletion criteria:\n{criteria}\n\nMap nodes this ticket touches (approved map revision {revision}):\n{targets}\n{missing}\nNeighboring nodes (context only):\n{related}\n\nRelationships of the touched nodes, preserving source, target, and relation type (context only):\n{related_edges}\n\nWhole project map at a glance (context only):\n{overview}",
         id = ticket.ticket_id,
         revision = ticket.map_revision,
         title = ticket.title,
@@ -1403,6 +1410,7 @@ pub async fn start_ticket_development(
         related = to_pretty(&ticket.related_nodes)?,
         related_edges = to_pretty(&ticket.related_edges)?,
         overview = to_pretty(&ticket.map_overview)?,
+        profile = profile_prompt_section(profile.as_ref()),
     );
     *guard = None;
     let session = match start_session(&app, project_id, &root, AgentMode::Development, false).await
@@ -1495,16 +1503,16 @@ pub(crate) async fn request_design_draft(
     let (context, context_revision) = design_context(&conn, project_id)?;
     let draft_instructions = match latest_draft {
         Some(draft) => format!(
-            "Revise the latest saved design draft only. Do not implement or create/edit files. Treat the saved draft below as the current user-edited source of truth; preserve stable IDs for unchanged nodes and apply the user's requested changes. Put the map payload inside result.draft in the required versioned response envelope. Its schema is {{\"goal\":string,\"nodes\":[{{\"id\":string,\"title\":string,\"summary\":string explaining the node's responsibility and boundaries,\"responsibilities\":[string],\"type\":\"component\",\"status\":\"not_started\",\"questions\":[{{\"prompt\":string,\"options\":[{{\"label\":string,\"recommended\":boolean}},{{\"label\":string,\"recommended\":boolean}}]}}]}}],\"edges\":[{{\"id\":string,\"source\":string,\"target\":string,\"relation\":\"depends_on\"|\"interacts_with\"}}],\"questions\":[string],\"assumptions\":[string]}}. Every node question has exactly two distinct options and exactly one recommended:true. The UI provides a third, user-entered option. Use two viable, concise alternatives and recommend the best fit to the user's stated goals. For depends_on, source requires target; for interacts_with, source interacts with target. Never use an untyped or generic related edge. Put unresolved decisions next to the relevant node in its questions array; use the top-level questions array only for project-wide questions. Use unique stable IDs, valid edge endpoints, at least one responsibility per node, and status not_started for every node.\n\nUser change request:\n{text}\n\nLatest saved user-edited design draft:\n{draft}"
+            "Revise the latest saved design draft only. Do not implement or create/edit files. Treat the saved draft below as the current user-edited source of truth; preserve stable IDs for unchanged nodes and apply the user's requested changes. Put the map payload inside result.draft in the required versioned response envelope. Its schema is {{\"goal\":string,\"nodes\":[{{\"id\":string,\"title\":string,\"summary\":string explaining the node's responsibility and boundaries,\"responsibilities\":[string],\"type\":\"component\",\"status\":\"not_started\",\"questions\":[{{\"prompt\":string,\"options\":[{{\"label\":string,\"recommended\":boolean}},{{\"label\":string,\"recommended\":boolean}}]}}]}}],\"edges\":[{{\"id\":string,\"source\":string,\"target\":string,\"relation\":\"depends_on\"|\"interacts_with\"}}],\"questions\":[string],\"assumptions\":[string]}}. Every node question has exactly two distinct options and exactly one recommended:true. The UI provides a third, user-entered option. Use two viable, concise alternatives and recommend the best fit to the user's stated goals. For depends_on, source requires target; for interacts_with, source interacts with target. Never use an untyped or generic related edge. Put unresolved decisions next to the relevant node in its questions array; use the top-level questions array only for project-wide questions. Use unique stable IDs, valid edge endpoints, at least one responsibility per node, and status not_started for every node. {PROFILE_DRAFT_RULES} Keep the saved draft's profile (or the confirmed profile) unless the user's change request asks to change the output form or stack; if neither exists, decide one with these rules.\n\nUser change request:\n{text}\n\nLatest saved user-edited design draft:\n{draft}"
         ),
         None => format!(
-            "Design a logical architecture map only. Do not implement or create/edit files. Nodes are persistent system responsibilities, not files or one-off tasks. Put the map payload inside result.draft in the required versioned response envelope. Its schema is {{\"goal\":string,\"nodes\":[{{\"id\":string,\"title\":string,\"summary\":string explaining the node's responsibility and boundaries,\"responsibilities\":[string],\"type\":\"component\",\"status\":\"not_started\",\"questions\":[{{\"prompt\":string,\"options\":[{{\"label\":string,\"recommended\":boolean}},{{\"label\":string,\"recommended\":boolean}}]}}]}}],\"edges\":[{{\"id\":string,\"source\":string,\"target\":string,\"relation\":\"depends_on\"|\"interacts_with\"}}],\"questions\":[string],\"assumptions\":[string]}}. Every node question has exactly two distinct options and exactly one recommended:true. The UI provides a third, user-entered option. Use two viable, concise alternatives and recommend the best fit to the user's stated goals. For depends_on, source requires target; for interacts_with, source interacts with target. Never use an untyped or generic related edge. Put unresolved decisions next to the relevant node in its questions array; use the top-level questions array only for project-wide questions. Use unique stable IDs, valid edge endpoints, at least one responsibility per node, and status not_started for every node.\n\nUser product description:\n{text}"
+            "Design a logical architecture map only. Do not implement or create/edit files. Nodes are persistent system responsibilities, not files or one-off tasks. Put the map payload inside result.draft in the required versioned response envelope. Its schema is {{\"goal\":string,\"nodes\":[{{\"id\":string,\"title\":string,\"summary\":string explaining the node's responsibility and boundaries,\"responsibilities\":[string],\"type\":\"component\",\"status\":\"not_started\",\"questions\":[{{\"prompt\":string,\"options\":[{{\"label\":string,\"recommended\":boolean}},{{\"label\":string,\"recommended\":boolean}}]}}]}}],\"edges\":[{{\"id\":string,\"source\":string,\"target\":string,\"relation\":\"depends_on\"|\"interacts_with\"}}],\"questions\":[string],\"assumptions\":[string]}}. Every node question has exactly two distinct options and exactly one recommended:true. The UI provides a third, user-entered option. Use two viable, concise alternatives and recommend the best fit to the user's stated goals. For depends_on, source requires target; for interacts_with, source interacts with target. Never use an untyped or generic related edge. Put unresolved decisions next to the relevant node in its questions array; use the top-level questions array only for project-wide questions. Use unique stable IDs, valid edge endpoints, at least one responsibility per node, and status not_started for every node. {PROFILE_DRAFT_RULES}\n\nUser product description:\n{text}"
         ),
     };
     let (draft_id, draft_version) =
         expected_draft.map_or((None, None), |(id, version)| (Some(id), Some(version)));
     let prompt = format!(
-        "Authoritative Heim context for this design turn:\n{context}\n\nReturn exactly one JSON object, no markdown, in this envelope: {{\"contractVersion\":2,\"mode\":\"design\",\"context\":{{\"mapRevision\":{context_revision},\"draftId\":{draft_id_json},\"draftVersion\":{draft_version_json},\"ticketId\":null}},\"result\":{{\"kind\":\"map_draft\",\"message\":string,\"draft\":{{\"goal\":string,\"nodes\":[...],\"edges\":[...],\"questions\":[string],\"assumptions\":[string]}}}}}}. Echo these exact context identifiers. The draft is a proposal, not saved or approved.\n\n{draft_instructions}",
+        "Authoritative Heim context for this design turn:\n{context}\n\nReturn exactly one JSON object, no markdown, in this envelope: {{\"contractVersion\":4,\"mode\":\"design\",\"context\":{{\"mapRevision\":{context_revision},\"draftId\":{draft_id_json},\"draftVersion\":{draft_version_json},\"ticketId\":null}},\"result\":{{\"kind\":\"map_draft\",\"message\":string,\"draft\":{{\"goal\":string,\"nodes\":[...],\"edges\":[...],\"questions\":[string],\"assumptions\":[string],\"profile\":{{...}}}}}}}}. Echo these exact context identifiers. The draft is a proposal, not saved or approved.\n\n{draft_instructions}",
         draft_id_json = draft_id.map_or("null".to_owned(), |id| id.to_string()),
         draft_version_json = draft_version.map_or("null".to_owned(), |version| version.to_string()),
     );
@@ -1550,6 +1558,7 @@ pub async fn plan_feature_tickets(
         )
         .map_err(|error| error.to_string())?;
     let context = feature_plan_context(&conn, project_id, feature_id)?;
+    let profile = load_project_profile(&conn, project_id)?;
     drop(conn);
     let allowed_node_ids = context
         .nodes
@@ -1558,12 +1567,17 @@ pub async fn plan_feature_tickets(
         .filter_map(|node| node["id"].as_str().map(str::to_owned))
         .collect::<Vec<_>>();
     let prompt = format!(
-        "HEIM MODE: TICKET PLANNING. This is read-only planning: do not edit files, run commands, or implement. Split the feature below into an ordered list of small development tickets. Each ticket is one focused Agent session that leaves the product working; together they complete the feature. Order tickets so each builds on the previous ones. Do not repeat work already covered by the existing tickets listed. A ticket may touch several map nodes and may change earlier work when needed. Reference the map nodes each ticket touches by id in nodeIds, using only ids from the confirmed map. Completion criteria must be concrete, observable, and independently assessable; include tests only when the behavior makes them relevant. Return exactly one JSON object without markdown: {{\"contractVersion\":2,\"mode\":\"design\",\"context\":{{\"mapRevision\":{revision},\"draftId\":null,\"draftVersion\":null,\"ticketId\":null}},\"result\":{{\"kind\":\"ticket_plan\",\"featureId\":{feature_id},\"tickets\":[{{\"title\":string,\"goal\":string,\"completionCriteria\":[string],\"nodeIds\":[string]}}]}}}}. Use 1-20 tickets, each title under 200 characters. Echo the exact revision and feature id.\n\nFeature:\n{feature}\n\nExisting tickets in this feature:\n{existing}\n\nConfirmed project map nodes:\n{nodes}\n\nConfirmed relationships:\n{edges}",
+        "HEIM MODE: TICKET PLANNING. This is read-only planning: do not edit files, run commands, or implement. Split the feature below into an ordered list of small development tickets. Each ticket is one focused Agent session that leaves the product working; together they complete the feature. Order tickets so each builds on the previous ones. Do not repeat work already covered by the existing tickets listed. A ticket may touch several map nodes and may change earlier work when needed. Reference the map nodes each ticket touches by id in nodeIds, using only ids from the confirmed map. Completion criteria must be concrete, observable, and independently assessable; include tests only when the behavior makes them relevant. Return exactly one JSON object without markdown: {{\"contractVersion\":4,\"mode\":\"design\",\"context\":{{\"mapRevision\":{revision},\"draftId\":null,\"draftVersion\":null,\"ticketId\":null}},\"result\":{{\"kind\":\"ticket_plan\",\"featureId\":{feature_id},\"tickets\":[{{\"title\":string,\"goal\":string,\"completionCriteria\":[string],\"nodeIds\":[string]}}]}}}}. Use 1-20 tickets, each title under 200 characters. Echo the exact revision and feature id. Write every ticket for the project profile below; tickets must not switch to another language or framework.\n\n{profile}\n\nFeature:\n{feature}\n\nExisting tickets in this feature:\n{existing}\n\nConfirmed project map nodes:\n{nodes}\n\nConfirmed relationships:\n{edges}",
         revision = context.map_revision,
         feature = to_pretty(&context.feature)?,
         existing = to_pretty(&context.existing_tickets)?,
         nodes = to_pretty(&context.nodes)?,
         edges = to_pretty(&context.edges)?,
+        profile = match &profile {
+            Some(profile) => format!("Project profile (authoritative):
+{}", to_pretty(profile)?),
+            None => "No confirmed project profile: plan in terms of the stack already used in the workspace.".to_owned(),
+        },
     );
     let response = request_design_turn(
         &app,
@@ -1641,7 +1655,7 @@ pub async fn send_design_message(
         .map_err(|error| error.to_string())?;
     let (map_context, context_revision) = design_context(&conn, project_id)?;
     let prompt = format!(
-        "HEIM MODE: DESIGN. Discuss architecture, clarify questions, and propose changes only. This session is read-only; do not create, edit, or delete files, run commands, or begin implementation. The backend-provided context is authoritative: respect its confirmed-map revision, and treat any pending draft as unconfirmed. Never claim a proposal is persisted or approved. Clearly label any proposed changes as suggestions and ask the user to use Heim's draft review to save and approve them. Return exactly one JSON object without markdown: {{\"contractVersion\":2,\"mode\":\"design\",\"context\":{{\"mapRevision\":{context_revision},\"draftId\":{draft_id},\"draftVersion\":{draft_version},\"ticketId\":null}},\"result\":{{\"kind\":\"discussion\",\"message\":string,\"questions\":[string],\"assumptions\":[string]}}}}. Echo the context identifiers exactly; do not include an unrequested map draft.\n\nAuthoritative persisted Heim context:\n{map_context}\n\nUser design request:\n{text}",
+        "HEIM MODE: DESIGN. Discuss architecture, clarify questions, and propose changes only. This session is read-only; do not create, edit, or delete files, run commands, or begin implementation. The backend-provided context is authoritative: respect its confirmed-map revision, and treat any pending draft as unconfirmed. Never claim a proposal is persisted or approved. Clearly label any proposed changes as suggestions and ask the user to use Heim's draft review to save and approve them. Return exactly one JSON object without markdown: {{\"contractVersion\":4,\"mode\":\"design\",\"context\":{{\"mapRevision\":{context_revision},\"draftId\":{draft_id},\"draftVersion\":{draft_version},\"ticketId\":null}},\"result\":{{\"kind\":\"discussion\",\"message\":string,\"questions\":[string],\"assumptions\":[string]}}}}. Echo the context identifiers exactly; do not include an unrequested map draft.\n\nAuthoritative persisted Heim context:\n{map_context}\n\nUser design request:\n{text}",
         draft_id = optional_context_id(&map_context, "/pendingDraft/id"),
         draft_version = optional_context_id(&map_context, "/pendingDraft/version"),
     );
@@ -1834,7 +1848,7 @@ mod tests {
             result_kind: "development_report",
         };
         let response = json!({
-            "contractVersion":2,
+            "contractVersion":4,
             "mode":"development",
             "context":{"mapRevision":7,"draftId":null,"draftVersion":null,"ticketId":42},
             "result":{
@@ -1867,7 +1881,7 @@ mod tests {
         let wrong_mode = response.replace("\"mode\":\"development\"", "\"mode\":\"design\"");
         assert!(validate_agent_response(&wrong_mode, &expected).is_err());
         let old_contract = response
-            .replace("\"contractVersion\":2", "\"contractVersion\":1")
+            .replace("\"contractVersion\":4", "\"contractVersion\":1")
             .replace("\"ticketId\":42", "\"unitId\":42");
         assert!(validate_agent_response(&old_contract, &expected).is_err());
     }
@@ -1886,7 +1900,7 @@ mod tests {
             result_kind: "discussion",
         };
         let response = json!({
-            "contractVersion":2,
+            "contractVersion":4,
             "mode":"design",
             "context":{"mapRevision":3,"draftId":9,"draftVersion":2,"ticketId":null},
             "result":{"kind":"discussion","message":"The draft keeps the approved map unchanged.","questions":[],"assumptions":[]}
@@ -1913,7 +1927,7 @@ mod tests {
             result_kind: "ticket_plan",
         };
         let response = json!({
-            "contractVersion":2,
+            "contractVersion":4,
             "mode":"design",
             "context":{"mapRevision":5,"draftId":null,"draftVersion":null,"ticketId":null},
             "result":{"kind":"ticket_plan","featureId":3,"tickets":[

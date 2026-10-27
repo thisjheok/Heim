@@ -8,6 +8,10 @@
   -moz-osx-font-smoothing: grayscale;
   font-optical-sizing: auto;
   font-weight: 400;
+  /* Type scale (docs/decisions/0003). Never go below --text-caption; restructure instead of shrinking. */
+  --text-caption: 12px;
+  --text-body: 13px;
+  --text-title: 14px;
 }
 
 * { box-sizing: border-box; }

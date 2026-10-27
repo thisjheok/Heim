@@ -12,6 +12,7 @@ Heim is a desktop workspace for planning and building software with an AI agent.
 
 - Create and edit a project's architecture map, with typed components and relationships.
 - Ask the AI agent to create or revise a design draft; review and explicitly approve the draft before it becomes the confirmed map.
+- Get the output form and tech stack from your request (or from existing files, or an AI proposal you approve with the map), and keep every agent turn on that stack. The stack is grouped by area (e.g. Frontend, Backend, Database) and shown in the Stack tab.
 - Plan work as features split into tickets (by the AI on request, or by hand). Each ticket has a goal, observable completion criteria, and the map nodes it touches; the next ticket is simply the first open one in order.
 - Run development through the Codex CLI, following its configured permissions and approval policy.
 - Review the agent's report, changed files, checks, and available run evidence before recording a review decision.

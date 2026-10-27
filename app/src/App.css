@@ -794,19 +794,27 @@
 .draft-profile > strong { color: #1f2c44; font-size: var(--text-title); }
 .draft-profile-source { justify-self: start; padding: 2px 9px; border-radius: 10px; color: #3e5f93; background: #e6eefb; font-size: var(--text-caption); }
 .draft-profile-source.is-ai_proposed { color: #62450e; background: #fff1cc; }
+.draft-profile-group { display: grid; gap: 4px; margin-top: 4px; padding-top: 8px; border-top: 1px solid #e3e9f3; }
 
-/* Project stack: areas as rows (name + technology tags), shown in the draft card and the Stack tab. */
+/* Project stack: each area is its name with technology tags below, shown in the draft card and the Stack tab. */
 .stack-area-list { display: grid; gap: 8px; margin: 0; }
-.stack-area-row { display: grid; grid-template-columns: minmax(90px, 140px) minmax(0, 1fr); gap: 10px; align-items: baseline; }
+.stack-area-row { display: grid; gap: 4px; }
 .stack-area-row dt { overflow-wrap: anywhere; color: #40506a; font-size: var(--text-body); font-weight: 650; }
 .stack-area-row dd { margin: 0; }
 .stack-tags { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; padding: 0; list-style: none; }
 .stack-tags li { padding: 2px 9px; border: 1px solid #d7e2f3; border-radius: 12px; color: #34507f; background: #f3f7fe; font-size: var(--text-caption); }
-.stack-content { display: grid; align-content: start; gap: 14px; max-width: 760px; color: #2c394f; font-size: var(--text-body); line-height: 1.5; }
+/* Stack tab: fills the tab width — overview card + area cards side by side, one column when narrow. */
+.stack-content { display: grid; align-content: start; gap: 12px; color: #2c394f; font-size: var(--text-body); line-height: 1.5; container-type: inline-size; }
 .stack-content > .workspace-content-heading { margin-bottom: 0; }
-.stack-section { display: grid; gap: 6px; }
+.stack-heading { flex-wrap: wrap; }
+.stack-heading .draft-profile-source { margin-left: 4px; }
+.stack-layout { display: grid; grid-template-columns: minmax(240px, 1fr) minmax(0, 2fr); gap: 12px; align-items: start; }
+.stack-card { display: grid; gap: 8px; min-width: 0; padding: 12px 14px; border: 1px solid #dfe6f1; border-radius: 8px; background: #fff; }
+.stack-overview .draft-summary-label + * { margin-bottom: 4px; }
 .stack-output { color: #1f2c44; font-size: var(--text-title); }
-.stack-section .draft-profile-source { justify-self: start; }
-@media (max-width: 560px) {
-  .stack-area-row { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+.stack-area-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 8px; margin: 0; padding: 0; list-style: none; }
+.stack-area-card { display: grid; align-content: start; gap: 6px; min-width: 0; padding: 9px 11px; border: 1px solid #e3e9f3; border-radius: 7px; background: #f8fafd; }
+.stack-area-card > strong { overflow-wrap: anywhere; color: #40506a; font-size: var(--text-body); font-weight: 650; }
+@container (max-width: 680px) {
+  .stack-layout { grid-template-columns: minmax(0, 1fr); }
 }

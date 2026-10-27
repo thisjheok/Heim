@@ -1232,9 +1232,12 @@ function App() {
                       <strong>{designDraft.draft.profile.outputForm}</strong>
                       <span className={`draft-profile-source is-${designDraft.draft.profile.source}`}>{draftProfileSourceLabels[designDraft.draft.profile.source]}</span>
                       <StackAreaList stack={designDraft.draft.profile.stack} />
-                      {designDraft.draft.profile.constraints.length > 0 && <ul className="draft-summary-list">
-                        {designDraft.draft.profile.constraints.map((constraint) => <li key={constraint}>{constraint}</li>)}
-                      </ul>}
+                      {designDraft.draft.profile.constraints.length > 0 && <div className="draft-profile-group" aria-label="Constraints">
+                        <span className="draft-summary-label">Constraints</span>
+                        <ul className="draft-summary-list">
+                          {designDraft.draft.profile.constraints.map((constraint) => <li key={constraint}>{constraint}</li>)}
+                        </ul>
+                      </div>}
                       {designDraft.draft.profile.rationale && <details className="draft-summary-details">
                         <summary>Why this stack</summary>
                         <p>{designDraft.draft.profile.rationale}</p>
